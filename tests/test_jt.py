@@ -248,6 +248,32 @@ def test_terminal_never_asks_for_action(conn):
 
 
 # --------------------------------------------------------------------------
+# priority()
+# --------------------------------------------------------------------------
+
+def test_priority_score_rewards_contact_and_response(conn):
+    cold = add_app(conn, "ColdCo", "Engineer", applied_on="2026-08-03")
+    warm = add_app(conn, "WarmCo", "Engineer", applied_on="2026-08-03",
+                   contact="recruiter@example.com")
+    add_event(conn, warm["id"], "screen", "2026-08-05")
+
+    cold_d = jt.derive(conn, cold, today=date(2026, 8, 12))
+    warm_d = jt.derive(conn, warm, today=date(2026, 8, 12))
+
+    assert jt.priority_score(warm, warm_d) > jt.priority_score(cold, cold_d)
+
+
+def test_priority_terms_explain_closeout_penalty(conn):
+    app = add_app(conn, applied_on="2026-07-06")
+    add_event(conn, app["id"], "followup_sent", "2026-07-14")
+    d = jt.derive(conn, app, today=date(2026, 8, 12))
+
+    terms = dict(jt.priority_terms(app, d))
+
+    assert terms["closeout"] == jt.WEIGHTS["closeout"]
+
+
+# --------------------------------------------------------------------------
 # transitions.py -- the Phase 3 gate
 # --------------------------------------------------------------------------
 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "jt-tracker"
-version = "0.2.0"
+version = "0.3.0"
 description = "Local-first job application tracker with an append-only event log"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -24,9 +24,11 @@ dev = ["pytest>=8.0"]
 
 [project.scripts]
 jt = "jt:main"
+jt-sync = "sync:main"
+jt-classify = "classify:main"
 
 [tool.setuptools]
-py-modules = ["jt", "transitions"]
+py-modules = ["jt", "transitions", "sync", "classify"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

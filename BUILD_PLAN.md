@@ -1,9 +1,10 @@
 # Build Plan — revision 2
 
-Phase 1 is built, hardened, and tested (40 passing). Phases 2–4 are specified
-below with prompts written to be pasted as-is.
+Phase 1 is built, hardened, and tested. Phases 2–4 are now implemented as
+`sync.py`, `classify.py`, `evals/run.py`, and `jt priority`.
 
-**Total remaining: ~4 hours across three sittings.**
+The original prompts are retained below as design history and acceptance
+criteria.
 
 The rule for the whole project: **the model proposes, deterministic code
 commits.** That boundary is the reason this is an engineering project and not a

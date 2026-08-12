@@ -91,6 +91,24 @@ EVENT_KINDS = tuple(k for k in STAGE_RANK if k != "applied") + TERMINAL + TOUCH
 FOLLOWUP_AFTER_BUSINESS_DAYS = 6
 CLOSEOUT_AFTER_BUSINESS_DAYS = 15
 
+# Scoring weights for `jt priority`. Tune these without reading the scorer.
+WEIGHTS = {
+    # Software roles get the stronger default push.
+    "swe_base": 2.0,
+    # Ops/comms roles still matter, just with a lower base.
+    "other_base": 1.0,
+    # A real contact is a warm channel and deserves action.
+    "contact": 3.0,
+    # Human inbound engagement is stronger than an ATS confirmation.
+    "had_response": 2.0,
+    # Later pipeline stages deserve more attention.
+    "stage_progress": 1.5,
+    # Every quiet business day decays urgency.
+    "quiet_day": -0.25,
+    # After one nudge and fifteen quiet business days, close it out.
+    "closeout": -10.0,
+}
+
 
 KINDS_DDL = """
 CREATE TABLE IF NOT EXISTS event_kinds (
@@ -318,6 +336,28 @@ def action_for(d: dict) -> str:
     return "wait"
 
 
+def priority_terms(app_row, d: dict) -> list[tuple[str, float]]:
+    max_rank = max(STAGE_RANK.values())
+    terms = [
+        ("base", WEIGHTS["swe_base"] if app_row["lane"] == "swe" else WEIGHTS["other_base"]),
+        ("contact", WEIGHTS["contact"] if app_row["contact_email"] else 0.0),
+        ("had_response", WEIGHTS["had_response"] if d["had_response"] else 0.0),
+        ("stage_progress", WEIGHTS["stage_progress"] * (d["stage_rank"] / max_rank)),
+        ("quiet", WEIGHTS["quiet_day"] * d["bdays_quiet"]),
+    ]
+    closeout = (
+        WEIGHTS["closeout"]
+        if d["followups"] >= 1 and d["bdays_quiet"] >= CLOSEOUT_AFTER_BUSINESS_DAYS
+        else 0.0
+    )
+    terms.append(("closeout", closeout))
+    return terms
+
+
+def priority_score(app_row, d: dict) -> float:
+    return sum(v for _, v in priority_terms(app_row, d))
+
+
 def pending_reviews(conn) -> int:
     return conn.execute(
         "SELECT COUNT(*) FROM review_queue WHERE resolved = 0").fetchone()[0]
@@ -434,6 +474,34 @@ def cmd_stale(conn, a):
     rows.sort(key=lambda r: (r[5] != "FOLLOW UP", -int(r[4][:-1])))
     print(review_banner(conn))
     print(table(["#", "COMPANY", "ROLE", "STATUS", "QUIET", "ACTION", "CONTACT"], rows))
+    print()
+
+
+def cmd_priority(conn, a):
+    today = date.fromisoformat(a.today) if a.today else None
+    if a.explain:
+        app = conn.execute("SELECT * FROM applications WHERE id = ?", (a.explain,)).fetchone()
+        if not app:
+            sys.exit(f"error: no application #{a.explain}")
+        d = derive(conn, app, today)
+        rows = [[name, f"{value:.2f}"] for name, value in priority_terms(app, d)]
+        rows.append(["TOTAL", f"{priority_score(app, d):.2f}"])
+        print(f"\n  #{app['id']}  {app['company']} - {app['role']}  ({d['status']})")
+        print(table(["TERM", "POINTS"], rows))
+        print(f"\n  action: {action_for(d)}\n")
+        return
+
+    rows = []
+    for app in conn.execute("SELECT * FROM applications ORDER BY applied_on, id"):
+        d = derive(conn, app, today)
+        if d["is_terminal"]:
+            continue
+        rows.append([priority_score(app, d), app, d])
+    rows.sort(key=lambda r: r[0], reverse=True)
+    out = [[app["id"], f"{score:.2f}", app["company"][:26], app["role"][:32],
+            d["status"], action_for(d)] for score, app, d in rows[:10]]
+    print()
+    print(table(["#", "SCORE", "COMPANY", "ROLE", "STATUS", "ACTION"], out))
     print()
 
 
@@ -574,6 +642,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("stale", help="what needs action today")
     s.set_defaults(fn=cmd_stale)
+
+    s = sub.add_parser("priority", help="rank open applications by next-action value")
+    s.add_argument("--explain", type=int, metavar="ID")
+    s.add_argument("--today", help=argparse.SUPPRESS)
+    s.set_defaults(fn=cmd_priority)
 
     s = sub.add_parser("log", help="append an event")
     s.add_argument("id", type=int)
