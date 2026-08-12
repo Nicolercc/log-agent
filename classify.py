@@ -7,13 +7,17 @@ and is validated like a form submission from a stranger.
 """
 
 import argparse
+import contextlib
+import fcntl
 import json
 import os
 import sqlite3
 import sys
+import time
 from dataclasses import dataclass
 from datetime import date
 from difflib import SequenceMatcher
+from pathlib import Path
 from typing import Any
 
 import jt
@@ -22,6 +26,7 @@ import transitions
 DEFAULT_MODEL = "claude-sonnet-4-6"
 DEFAULT_BATCH_SIZE = 10
 DEFAULT_MIN_CONFIDENCE = 0.85
+MAX_MODEL_ATTEMPTS = 5
 COMPANY_MIN_SCORE = 88.0
 ROLE_MIN_SCORE = 80.0
 RUNNER_UP_GAP = 10.0
@@ -58,6 +63,39 @@ def _batch_size() -> int:
         return int(os.environ.get("CLASSIFIER_BATCH_SIZE", DEFAULT_BATCH_SIZE))
     except ValueError:
         raise SystemExit("error: CLASSIFIER_BATCH_SIZE must be an integer")
+
+
+def _status_code(exc: Exception) -> int | None:
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status is None:
+        status = getattr(getattr(exc, "resp", None), "status", None)
+    return int(status) if status is not None else None
+
+
+def _retryable(exc: Exception) -> bool:
+    return _status_code(exc) in {408, 409, 429, 500, 502, 503, 504}
+
+
+@contextlib.contextmanager
+def classifier_lock(path: Path | None = None):
+    """One classifier process at a time per database.
+
+    The lock is advisory and process-scoped. If the process dies, the OS releases
+    it, so stale lock files are harmless.
+    """
+    lock_path = path or jt.db_path().with_suffix(jt.db_path().suffix + ".classify.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a") as f:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise SystemExit("error: another jt-classify process is already running")
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
 
 
 def load_unprocessed(conn, limit: int) -> list[sqlite3.Row]:
@@ -104,14 +142,22 @@ def build_classifier_client():
     return anthropic.Anthropic()
 
 
-def call_model(client, messages: list[sqlite3.Row]) -> str:
+def call_model(client, messages: list[sqlite3.Row], sleep=time.sleep) -> str:
     model = os.environ.get("CLASSIFIER_MODEL", DEFAULT_MODEL)
-    response = client.messages.create(
-        model=model,
-        max_tokens=3000,
-        messages=[{"role": "user", "content": prompt_for(messages)}],
-    )
-    return response.content[0].text
+    delay = 1.0
+    for attempt in range(1, MAX_MODEL_ATTEMPTS + 1):
+        try:
+            response = client.messages.create(
+                model=model,
+                max_tokens=3000,
+                messages=[{"role": "user", "content": prompt_for(messages)}],
+            )
+            return response.content[0].text
+        except Exception as e:
+            if not _retryable(e) or attempt == MAX_MODEL_ATTEMPTS:
+                raise
+            sleep(delay)
+            delay *= 2
 
 
 def parse_json_array(raw: str) -> tuple[list[dict[str, Any]] | None, str]:
@@ -283,7 +329,7 @@ def commit_verdict(conn, verdict: Verdict) -> str:
     assert verdict.proposal is not None and verdict.application_id is not None
     p = verdict.proposal
     try:
-        conn.execute(
+        cur = conn.execute(
             """INSERT OR IGNORE INTO events
                (application_id, occurred_on, kind, gmail_msg_id, confidence, evidence)
                VALUES (?,?,?,?,?,?)""",
@@ -292,6 +338,8 @@ def commit_verdict(conn, verdict: Verdict) -> str:
         )
     except sqlite3.IntegrityError as e:
         return f"database rejected event: {e}"
+    if cur.rowcount == 0:
+        return "duplicate gmail_msg_id already exists in events; no event inserted"
     return ""
 
 
@@ -317,7 +365,7 @@ def apply_verdicts(conn, verdicts: list[Verdict]) -> tuple[int, int]:
     return committed, reviewed
 
 
-def process_batch(conn, client, *, dry_run: bool = False) -> tuple[int, int, int]:
+def _process_batch_unlocked(conn, client, *, dry_run: bool = False) -> tuple[int, int, int]:
     messages = load_unprocessed(conn, _batch_size())
     if not messages:
         return 0, 0, 0
@@ -330,6 +378,13 @@ def process_batch(conn, client, *, dry_run: bool = False) -> tuple[int, int, int
         return len(messages), sum(1 for v in verdicts if v.ok), sum(1 for v in verdicts if not v.ok)
     committed, reviewed = apply_verdicts(conn, verdicts)
     return len(messages), committed, reviewed
+
+
+def process_batch(conn, client, *, dry_run: bool = False) -> tuple[int, int, int]:
+    if dry_run:
+        return _process_batch_unlocked(conn, client, dry_run=True)
+    with classifier_lock():
+        return _process_batch_unlocked(conn, client, dry_run=False)
 
 
 def build_parser() -> argparse.ArgumentParser:

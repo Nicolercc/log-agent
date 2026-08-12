@@ -156,3 +156,18 @@ def test_overlap_window_refetches_without_duplication(conn, monkeypatch):
     )
     _, inserted = sync.sync_messages(conn, svc, today=date(2026, 8, 20))
     assert inserted == 0
+
+
+def test_empty_sync_advances_watermark_to_run_day(conn):
+    svc = Service(
+        [{"messages": []}],
+        {},
+    )
+
+    seen, inserted = sync.sync_messages(
+        conn, svc, since="2026-08-01", today=date(2026, 8, 20))
+
+    assert (seen, inserted) == (0, 0)
+    assert conn.execute(
+        "SELECT value FROM sync_state WHERE key = 'gmail_last_synced'"
+    ).fetchone()[0] == "2026-08-20"

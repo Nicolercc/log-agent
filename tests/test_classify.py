@@ -1,4 +1,5 @@
 import json
+import fcntl
 
 import pytest
 
@@ -160,3 +161,72 @@ def test_event_before_application_date_goes_to_review(conn):
 
     assert "predates application date" in conn.execute(
         "SELECT reason FROM review_queue").fetchone()[0]
+
+
+def test_duplicate_event_is_not_counted_as_commit(conn):
+    add_app(conn)
+    other_app_id = add_app(conn, company="OtherCo", role="Engineer")
+    add_raw(conn)
+    conn.execute(
+        """INSERT INTO events
+           (application_id, occurred_on, kind, gmail_msg_id)
+           VALUES (?,?,?,?)""",
+        (other_app_id, "2026-08-02", "confirmed", "m1"),
+    )
+    conn.commit()
+
+    seen, committed, reviewed = classify.process_batch(
+        conn, FakeClient(json.dumps([proposal()])))
+
+    assert (seen, committed, reviewed) == (1, 0, 1)
+    assert "duplicate gmail_msg_id" in conn.execute(
+        "SELECT reason FROM review_queue").fetchone()[0]
+
+
+def test_classifier_lock_refuses_second_process(conn, tmp_path):
+    lock_path = tmp_path / "test.db.classify.lock"
+    with lock_path.open("a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(SystemExit, match="another jt-classify"):
+            with classify.classifier_lock(lock_path):
+                pass
+        fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def test_call_model_retries_retryable_errors():
+    class Retryable(Exception):
+        status_code = 429
+
+    class Client:
+        def __init__(self):
+            self.calls = 0
+
+        class Messages:
+            def __init__(self, outer):
+                self.outer = outer
+
+            def create(self, **kwargs):
+                self.outer.calls += 1
+                if self.outer.calls == 1:
+                    raise Retryable("slow down")
+
+                class Response:
+                    pass
+
+                class Content:
+                    pass
+
+                r = Response()
+                c = Content()
+                c.text = "[]"
+                r.content = [c]
+                return r
+
+        @property
+        def messages(self):
+            return self.Messages(self)
+
+    client = Client()
+
+    assert classify.call_model(client, [], sleep=lambda _: None) == "[]"
+    assert client.calls == 2

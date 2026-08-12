@@ -8,6 +8,7 @@ itself without live API credentials.
 """
 
 import argparse
+import importlib.resources
 import json
 import os
 import sys
@@ -22,9 +23,18 @@ import classify
 import jt
 
 
+def _fixture_lines(path: Path):
+    if path.exists():
+        return path.open(encoding="utf-8")
+    if path.name == "fixtures.example.jsonl":
+        return importlib.resources.files("evals").joinpath(path.name).open(
+            encoding="utf-8")
+    raise FileNotFoundError(path)
+
+
 def load_fixtures(path: Path) -> list[dict]:
     fixtures = []
-    with path.open(encoding="utf-8") as f:
+    with _fixture_lines(path) as f:
         for line in f:
             line = line.strip()
             if line:
@@ -81,6 +91,16 @@ def expected_response(fixtures: list[dict]) -> str:
     return json.dumps(proposals)
 
 
+def _actual_commit(verdict, app_company: dict[int, str]) -> dict | None:
+    if not verdict.ok or not verdict.proposal:
+        return None
+    return {
+        "kind": verdict.proposal.get("kind"),
+        "company": app_company.get(verdict.application_id),
+        "application_id": verdict.application_id,
+    }
+
+
 def run_eval(fixtures: list[dict], *, use_expected: bool = False, client=None) -> dict:
     with tempfile.TemporaryDirectory() as d:
         old = os.environ.get("JT_DB")
@@ -92,6 +112,10 @@ def run_eval(fixtures: list[dict], *, use_expected: bool = False, client=None) -
             raw = expected_response(fixtures) if use_expected else classify.call_model(
                 client or classify.build_classifier_client(), messages)
             verdicts = classify.verdicts_for(conn, messages, raw)
+            app_company = {
+                row["id"]: row["company"]
+                for row in conn.execute("SELECT id, company FROM applications")
+            }
         finally:
             if "conn" in locals():
                 conn.close()
@@ -101,22 +125,34 @@ def run_eval(fixtures: list[dict], *, use_expected: bool = False, client=None) -
                 os.environ["JT_DB"] = old
 
     expected = {fx["id"]: (fx.get("expect") or {}) for fx in fixtures}
-    actual_commits = {v.gmail_msg_id for v in verdicts if v.ok}
-    expected_commits = {
-        msg_id for msg_id, exp in expected.items() if exp.get("should_commit")
+    actual_by_id = {
+        v.gmail_msg_id: actual
+        for v in verdicts
+        if (actual := _actual_commit(v, app_company)) is not None
     }
-    true_commits = actual_commits & expected_commits
-    false_commits = actual_commits - expected_commits
+    expected_commits = {
+        msg_id: exp for msg_id, exp in expected.items() if exp.get("should_commit")
+    }
+    true_commits = {
+        msg_id
+        for msg_id, actual in actual_by_id.items()
+        if msg_id in expected_commits
+        and actual["kind"] == expected_commits[msg_id].get("kind")
+        and actual["company"] == expected_commits[msg_id].get("company")
+    }
+    false_commits = set(actual_by_id) - true_commits
+    missed_commits = set(expected_commits) - true_commits
 
-    precision = len(true_commits) / len(actual_commits) if actual_commits else 1.0
+    precision = len(true_commits) / len(actual_by_id) if actual_by_id else 1.0
     recall = len(true_commits) / len(expected_commits) if expected_commits else 1.0
     return {
         "fixtures": len(fixtures),
         "expected_commits": len(expected_commits),
-        "actual_commits": len(actual_commits),
+        "actual_commits": len(actual_by_id),
         "precision": precision,
         "recall": recall,
         "misclassifications_reached_events": len(false_commits),
+        "missed_expected_commits": len(missed_commits),
         "reviewed": len([v for v in verdicts if not v.ok]),
     }
 
@@ -127,6 +163,7 @@ def print_report(report: dict) -> None:
     print(f"actual commits: {report['actual_commits']}")
     print(f"precision: {report['precision']:.2%}")
     print(f"recall: {report['recall']:.2%}")
+    print(f"missed expected commits: {report['missed_expected_commits']}")
     print(f"reviewed: {report['reviewed']}")
     print()
     print(
@@ -146,7 +183,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
     path = Path(args.fixtures)
-    if not path.exists():
+    if not path.exists() and path.name != "fixtures.example.jsonl":
         raise SystemExit(
             f"error: {path} does not exist. Copy/redact fixtures from "
             "evals/fixtures.example.jsonl first."

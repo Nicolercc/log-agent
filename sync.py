@@ -13,7 +13,6 @@ import html
 import os
 import random
 import re
-import sys
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -62,6 +61,7 @@ def build_gmail_service():
     token_path = Path(os.environ.get("GOOGLE_TOKEN_PATH", "~/.jobtrack/token.json")).expanduser()
     creds = None
     if token_path.exists():
+        token_path.chmod(0o600)
         creds = Credentials.from_authorized_user_file(str(token_path), [GMAIL_SCOPE])
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
@@ -71,6 +71,7 @@ def build_gmail_service():
             creds = flow.run_local_server(port=0)
         token_path.parent.mkdir(parents=True, exist_ok=True)
         token_path.write_text(creds.to_json(), encoding="utf-8")
+        token_path.chmod(0o600)
     return build("gmail", "v1", credentials=creds)
 
 
@@ -214,7 +215,8 @@ def set_watermark(conn, day: str) -> None:
 def sync_messages(conn, service, *, since: str | None = None, dry_run: bool = False,
                   today: date | None = None, sleep=time.sleep) -> tuple[int, int]:
     label = os.environ.get("GMAIL_LABEL", DEFAULT_LABEL)
-    since_day = start_day(conn, since, today)
+    run_day = today or date.today()
+    since_day = start_day(conn, since, run_day)
     query = gmail_query(label, since_day)
     page_token = None
     inserted = seen = 0
@@ -235,7 +237,8 @@ def sync_messages(conn, service, *, since: str | None = None, dry_run: bool = Fa
                 print(f"{row.received_on or '-'}  {row.sender or '-'}  {row.subject or '-'}")
         else:
             inserted += insert_rows(conn, batch)
-            mark = max((r.received_on for r in batch if r.received_on), default=since_day)
+            mark = max((r.received_on for r in batch if r.received_on),
+                       default=run_day.isoformat())
             set_watermark(conn, mark)
             conn.commit()
 

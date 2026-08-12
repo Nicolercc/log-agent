@@ -151,6 +151,13 @@ def test_duplicate_application_is_rejected(conn):
         add_app(conn, "Acme", "Engineer", applied_on="2026-08-03")
 
 
+def test_add_rejects_empty_company_or_role(conn):
+    parser = jt.build_parser()
+    args = parser.parse_args(["add", "   ", "Engineer", "--lane", "swe"])
+    with pytest.raises(SystemExit, match="company and role"):
+        jt.cmd_add(conn, args)
+
+
 # --------------------------------------------------------------------------
 # derive()
 # --------------------------------------------------------------------------
@@ -346,3 +353,34 @@ def test_v1_database_migrates_without_losing_events(tmp_path, monkeypatch):
             c.execute("DELETE FROM events")
     finally:
         c.close()
+
+
+# --------------------------------------------------------------------------
+# review resolution
+# --------------------------------------------------------------------------
+
+def test_resolve_requires_existing_queue_item(conn):
+    parser = jt.build_parser()
+    args = parser.parse_args(["resolve", "99"])
+    with pytest.raises(SystemExit, match="no review queue item"):
+        jt.cmd_resolve(conn, args)
+
+
+def test_resolve_can_link_to_event(conn):
+    app = add_app(conn)
+    add_event(conn, app["id"], "screen", "2026-08-05")
+    event_id = conn.execute("SELECT id FROM events").fetchone()[0]
+    conn.execute(
+        """INSERT INTO review_queue (gmail_msg_id, proposed_json, reason)
+           VALUES ('m1', '{}', 'needs human')"""
+    )
+    conn.commit()
+
+    parser = jt.build_parser()
+    args = parser.parse_args(["resolve", "1", "--event-id", str(event_id), "--note", "handled"])
+    jt.cmd_resolve(conn, args)
+
+    row = conn.execute("SELECT * FROM review_queue WHERE id = 1").fetchone()
+    assert row["resolved"] == 1
+    assert row["resolved_event_id"] == event_id
+    assert row["resolved_note"] == "handled"

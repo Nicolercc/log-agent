@@ -10,6 +10,7 @@ token.json
 *.db
 *.db-journal
 *.sqlite
+*.classify.lock
 backups/
 today.txt
 pursuit*.csv

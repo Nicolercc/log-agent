@@ -49,6 +49,13 @@ pipx install -e ".[gmail]"             # jt-sync
 pipx install -e ".[gmail,classify]"    # jt-sync + jt-classify
 ```
 
+From GitHub:
+
+```bash
+pipx install "jt-tracker @ git+https://github.com/Nicolercc/log-agent@v0.3.1"
+pipx install "jt-tracker[gmail,classify] @ git+https://github.com/Nicolercc/log-agent@v0.3.1"
+```
+
 ## Use
 
 ```bash
@@ -108,6 +115,10 @@ types, evidence spans, company/role matching, confidence, dates, and legal
 state transitions before inserting an event. Anything ambiguous lands in
 `review_queue` and the raw message is marked processed so it cannot loop
 forever.
+
+Only one `jt-classify` process can run against a database at a time. The lock is
+advisory and OS-released, so a crashed classifier will not leave a permanent
+deadlock.
 
 ---
 
@@ -174,13 +185,13 @@ Hygiene makes a project defensible. Measurement makes it interesting. Label
 thirty emails once, then run:
 
 ```bash
-python evals/run.py evals/fixtures.jsonl
+jt-eval evals/fixtures.jsonl
 ```
 
 The checked-in redacted example can exercise the harness without credentials:
 
 ```bash
-python evals/run.py evals/fixtures.example.jsonl --use-expected
+jt-eval evals/fixtures.example.jsonl --use-expected
 ```
 
 Then you can state:
@@ -204,8 +215,35 @@ system is quietly rotting.
 pip install -e ".[dev]" && python -m pytest -q
 ```
 
-55 tests. Every staleness assertion passes an explicit `today` — a suite whose
+63 tests. Every staleness assertion passes an explicit `today` — a suite whose
 results change at midnight is a suite you learn to ignore.
+
+## Live Acceptance
+
+These require local credentials and are intentionally not run in CI:
+
+```bash
+jt-sync --dry-run
+jt-sync
+jt-sync        # second run should insert zero rows
+
+jt-classify --dry-run
+jt-classify
+jt review
+
+jt-eval evals/fixtures.jsonl
+```
+
+Before running them: rotate any previously committed Google OAuth client secret,
+enable Gmail API read-only scope, create the Gmail `jobsearch` label/filter, set
+`ANTHROPIC_API_KEY`, and create a redacted `evals/fixtures.jsonl` from real mail.
+
+Suggested local schedule after acceptance:
+
+```cron
+0 8 * * 1-5 /usr/local/bin/jt-sync && /usr/local/bin/jt-classify
+0 20 * * * /usr/local/bin/jt backup ~/Dropbox/jobtrack
+```
 
 ---
 

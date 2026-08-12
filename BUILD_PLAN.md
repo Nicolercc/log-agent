@@ -2,6 +2,8 @@
 
 Phase 1 is built, hardened, and tested. Phases 2–4 are now implemented as
 `sync.py`, `classify.py`, `evals/run.py`, and `jt priority`.
+The audit hardening pass added exact eval scoring, classifier locking, retry,
+duplicate accounting, review-resolution audit fields, and `jt-eval`.
 
 The original prompts are retained below as design history and acceptance
 criteria.

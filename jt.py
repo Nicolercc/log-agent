@@ -55,7 +55,7 @@ import sys
 from datetime import date, timedelta
 from pathlib import Path
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # --------------------------------------------------------------------------
 # Domain vocabulary. You own this. Changing it is a schema-level decision.
@@ -179,6 +179,9 @@ CREATE TABLE IF NOT EXISTS review_queue (
     proposed_json TEXT NOT NULL,
     reason        TEXT NOT NULL,
     resolved      INTEGER NOT NULL DEFAULT 0,
+    resolved_event_id INTEGER REFERENCES events(id),
+    resolved_note TEXT,
+    resolved_at TEXT,
     created_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -231,6 +234,21 @@ def _migrate_v1_to_v2(conn) -> None:
     print("migrated database to schema v2 (append-only enforced)", file=sys.stderr)
 
 
+def _ensure_review_columns(conn) -> None:
+    cols = {
+        row["name"] if isinstance(row, sqlite3.Row) else row[1]
+        for row in conn.execute("PRAGMA table_info(review_queue)")
+    }
+    additions = {
+        "resolved_event_id": "ALTER TABLE review_queue ADD COLUMN resolved_event_id INTEGER REFERENCES events(id)",
+        "resolved_note": "ALTER TABLE review_queue ADD COLUMN resolved_note TEXT",
+        "resolved_at": "ALTER TABLE review_queue ADD COLUMN resolved_at TEXT",
+    }
+    for name, ddl in additions.items():
+        if name not in cols:
+            conn.execute(ddl)
+
+
 def connect() -> sqlite3.Connection:
     path = db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -251,6 +269,7 @@ def connect() -> sqlite3.Connection:
     if _is_legacy(conn):
         _migrate_v1_to_v2(conn)
     conn.executescript(SCHEMA)
+    _ensure_review_columns(conn)
     conn.execute(
         "INSERT OR REPLACE INTO sync_state (key, value) VALUES ('schema_version', ?)",
         (str(SCHEMA_VERSION),),
@@ -393,18 +412,22 @@ def review_banner(conn) -> str:
 
 def cmd_add(conn, a):
     day = parse_day(a.on)
+    company = a.company.strip()
+    role = a.role.strip()
+    if not company or not role:
+        sys.exit("error: company and role must be non-empty")
     try:
         cur = conn.execute(
             """INSERT INTO applications
                (company, role, lane, applied_on, source, contact_email, url, notes)
                VALUES (?,?,?,?,?,?,?,?)""",
-            (a.company.strip(), a.role.strip(), a.lane, day,
+            (company, role, a.lane, day,
              a.source, a.contact, a.url, a.notes),
         )
         conn.commit()
-        print(f"#{cur.lastrowid}  {a.company} - {a.role}  [{a.lane}]  applied {day}")
+        print(f"#{cur.lastrowid}  {company} - {role}  [{a.lane}]  applied {day}")
     except sqlite3.IntegrityError:
-        print(f"already logged: {a.company} - {a.role} on {day}")
+        print(f"already logged: {company} - {role} on {day}")
 
 
 def cmd_bulk(conn, a):
@@ -422,6 +445,10 @@ def cmd_bulk(conn, a):
             continue
         company, role, lane = parts[0], parts[1], parts[2].lower()
         url = parts[3] if len(parts) > 3 else None
+        if not company or not role:
+            print(f"  skip (empty company/role): {line}")
+            skipped += 1
+            continue
         if lane not in LANES:
             print(f"  skip (bad lane {lane!r}): {line}")
             skipped += 1
@@ -611,9 +638,28 @@ def cmd_review(conn, a):
 
 
 def cmd_resolve(conn, a):
-    conn.execute("UPDATE review_queue SET resolved = 1 WHERE id = ?", (a.queue_id,))
+    row = conn.execute(
+        "SELECT * FROM review_queue WHERE id = ?", (a.queue_id,)).fetchone()
+    if not row:
+        sys.exit(f"error: no review queue item #{a.queue_id}")
+    if a.event_id:
+        event = conn.execute("SELECT id FROM events WHERE id = ?", (a.event_id,)).fetchone()
+        if not event:
+            sys.exit(f"error: no event #{a.event_id}")
+    cur = conn.execute(
+        """UPDATE review_queue
+           SET resolved = 1,
+               resolved_event_id = ?,
+               resolved_note = ?,
+               resolved_at = datetime('now')
+           WHERE id = ? AND resolved = 0""",
+        (a.event_id, a.note, a.queue_id),
+    )
     conn.commit()
-    print(f"resolved queue item {a.queue_id}")
+    if cur.rowcount == 0:
+        print(f"queue item {a.queue_id} was already resolved")
+    else:
+        print(f"resolved queue item {a.queue_id}")
 
 
 def cmd_where(conn, a):
@@ -670,7 +716,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(fn=cmd_review)
 
     s = sub.add_parser("resolve", help="mark a review item handled")
-    s.add_argument("queue_id", type=int); s.set_defaults(fn=cmd_resolve)
+    s.add_argument("queue_id", type=int)
+    s.add_argument("--event-id", type=int)
+    s.add_argument("--note")
+    s.set_defaults(fn=cmd_resolve)
 
     s = sub.add_parser("where", help="print database path")
     s.set_defaults(fn=cmd_where)
