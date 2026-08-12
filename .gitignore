@@ -1,0 +1,35 @@
+# Secrets. This file exists before the first commit, deliberately.
+credentials/
+tokens/
+token.json
+*.client_secret.json
+.env
+.env.local
+
+# Local data. Your job search is not public.
+*.db
+*.db-journal
+*.sqlite
+backups/
+today.txt
+pursuit*.csv
+
+# Eval fixtures made from real mail. Only the redacted example is tracked.
+evals/fixtures.jsonl
+evals/raw/
+
+# Python
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# Editors / OS
+.DS_Store
+.vscode/
+.idea/

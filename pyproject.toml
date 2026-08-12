@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jt-tracker"
+version = "0.2.0"
+description = "Local-first job application tracker with an append-only event log"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = []
+
+[project.optional-dependencies]
+gmail = [
+  "google-api-python-client>=2.120",
+  "google-auth-oauthlib>=1.2",
+]
+classify = [
+  "anthropic>=0.40",
+  "rapidfuzz>=3.9",
+]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+jt = "jt:main"
+
+[tool.setuptools]
+py-modules = ["jt", "transitions"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
