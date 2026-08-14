@@ -220,6 +220,7 @@ def sync_messages(conn, service, *, since: str | None = None, dry_run: bool = Fa
     query = gmail_query(label, since_day)
     page_token = None
     inserted = seen = 0
+    best_received: str | None = None
 
     while True:
         req = service.users().messages().list(
@@ -237,14 +238,23 @@ def sync_messages(conn, service, *, since: str | None = None, dry_run: bool = Fa
                 print(f"{row.received_on or '-'}  {row.sender or '-'}  {row.subject or '-'}")
         else:
             inserted += insert_rows(conn, batch)
-            mark = max((r.received_on for r in batch if r.received_on),
-                       default=run_day.isoformat())
-            set_watermark(conn, mark)
             conn.commit()
+            for row in batch:
+                if row.received_on and (best_received is None or row.received_on > best_received):
+                    best_received = row.received_on
 
         page_token = page.get("nextPageToken")
         if not page_token:
             break
+
+    if not dry_run:
+        # Advance the watermark only after the full run's pages have all
+        # committed, using the max received_on seen across every page -- not
+        # each page's own max. Gmail lists newest-first by default, so a
+        # per-page write would let the last (oldest) page silently roll the
+        # watermark backward even on a run that completes cleanly.
+        set_watermark(conn, best_received or run_day.isoformat())
+        conn.commit()
 
     return seen, inserted
 

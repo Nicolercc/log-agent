@@ -158,6 +158,26 @@ def test_overlap_window_refetches_without_duplication(conn, monkeypatch):
     assert inserted == 0
 
 
+def test_watermark_uses_the_run_wide_max_not_the_last_page(conn):
+    """Gmail lists newest-first by default, so the last page fetched is
+    usually the OLDEST. Writing the watermark per-page (using only that
+    page's own max) lets the final page silently roll it backward even on a
+    clean run. The watermark must reflect the max received_on across every
+    page, and must be written once, after the whole run completes."""
+    svc = Service(
+        [
+            {"messages": [{"id": "m1"}], "nextPageToken": "next"},  # newest page, first
+            {"messages": [{"id": "m2"}]},                             # oldest page, last
+        ],
+        {"m1": message("m1", day="2026-08-10"), "m2": message("m2", day="2026-08-01")},
+    )
+    sync.sync_messages(conn, svc, since="2026-07-01", today=date(2026, 8, 12))
+    watermark = conn.execute(
+        "SELECT value FROM sync_state WHERE key = 'gmail_last_synced'"
+    ).fetchone()[0]
+    assert watermark == "2026-08-10"
+
+
 def test_empty_sync_advances_watermark_to_run_day(conn):
     svc = Service(
         [{"messages": []}],

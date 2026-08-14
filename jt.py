@@ -55,6 +55,8 @@ import sys
 from datetime import date, timedelta
 from pathlib import Path
 
+from transitions import is_legal
+
 SCHEMA_VERSION = 3
 
 # --------------------------------------------------------------------------
@@ -210,27 +212,88 @@ def _seed_kinds(conn) -> None:
 
 
 def _is_legacy(conn) -> bool:
-    """v1 shipped events with ON DELETE CASCADE and no kind FK."""
+    """v1 shipped events with ON DELETE CASCADE and no kind FK.
+
+    A leftover `events_legacy` table means an earlier migration attempt (on
+    an older build) was interrupted after the rename but before it finished
+    -- treat that as unmigrated too, rather than trusting whatever partial
+    `events` table it left behind.
+    """
     row = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='events'"
     ).fetchone()
-    return bool(row and "ON DELETE CASCADE" in (row[0] or ""))
+    legacy_shape = bool(row and "ON DELETE CASCADE" in (row[0] or ""))
+    orphaned_rename = bool(conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events_legacy'"
+    ).fetchone())
+    return legacy_shape or orphaned_rename
 
 
 def _migrate_v1_to_v2(conn) -> None:
-    """Rebuild events with RESTRICT + kind FK, preserving every row."""
-    conn.executescript("ALTER TABLE events RENAME TO events_legacy;")
-    conn.executescript(EVENTS_DDL)
-    conn.execute("""
-        INSERT INTO events
-            (id, application_id, occurred_on, kind, gmail_msg_id,
-             confidence, evidence, created_at)
-        SELECT id, application_id, occurred_on, kind, gmail_msg_id,
-               confidence, evidence, created_at
-        FROM events_legacy
-    """)
-    conn.executescript("DROP TABLE events_legacy;")
-    conn.commit()
+    """Rebuild events with RESTRICT + kind FK, preserving every row.
+
+    Runs as one real SQLite transaction. ALTER/CREATE/DROP TABLE are all
+    transactional DDL in SQLite, so as long as executescript() (which forces
+    an implicit commit before it runs) is never used here, a crash anywhere
+    in this function leaves the database exactly as it was before migration
+    started -- not half-migrated with history sitting in an orphaned table
+    nobody looks at again.
+
+    A `PRAGMA foreign_key_check` gate before the commit refuses to finish if
+    any legacy row's `kind` isn't in `event_kinds`: silently letting such a
+    row fall outside invariant 4 forever (invisible to every derive() call,
+    still on disk) is worse than refusing to migrate.
+    """
+    conn.commit()  # close out the implicit transaction _seed_kinds left open
+    recovering = bool(conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events_legacy'"
+    ).fetchone())
+
+    old_isolation = conn.isolation_level
+    conn.isolation_level = None  # manual BEGIN/COMMIT/ROLLBACK below
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if recovering:
+            # An older build's migration died after the rename but before
+            # the copy/drop. Discard whatever partial 'events' table it left
+            # behind and recover from the real data in events_legacy.
+            conn.execute("DROP TABLE IF EXISTS events")
+        else:
+            conn.execute("ALTER TABLE events RENAME TO events_legacy")
+
+        conn.execute(EVENTS_DDL)
+        conn.execute("""
+            INSERT INTO events
+                (id, application_id, occurred_on, kind, gmail_msg_id,
+                 confidence, evidence, created_at)
+            SELECT id, application_id, occurred_on, kind, gmail_msg_id,
+                   confidence, evidence, created_at
+            FROM events_legacy
+        """)
+
+        violations = conn.execute("PRAGMA foreign_key_check(events)").fetchall()
+        if violations:
+            bad_kinds = sorted({
+                conn.execute(
+                    "SELECT kind FROM events WHERE rowid = ?", (v[1],)
+                ).fetchone()[0]
+                for v in violations
+            })
+            raise RuntimeError(
+                "migration refused: legacy events has kind(s) not in "
+                f"event_kinds: {', '.join(bad_kinds)}. This entire attempt "
+                "rolls back -- your database is untouched, still on the old "
+                "schema. Fix or remap those rows by hand, or add the "
+                "kind(s) to jt.py's EVENT_KINDS, then re-run."
+            )
+
+        conn.execute("DROP TABLE events_legacy")
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.isolation_level = old_isolation
     print("migrated database to schema v2 (append-only enforced)", file=sys.stderr)
 
 
@@ -319,7 +382,12 @@ def derive(conn, app_row, today: date | None = None) -> dict:
 
     terminal = [e for e in events if e["kind"] in TERMINAL]
     if terminal:
-        status = terminal[-1]["kind"]
+        # The most recently APPENDED terminal event wins, not the one with
+        # the latest occurred_on. A correction is entered after the fact and
+        # is often dated to when it actually happened, which can be earlier
+        # than the mistake it corrects -- id (insertion order) is the only
+        # thing that reliably tracks "the user's most recent word."
+        status = max(terminal, key=lambda e: e["id"])["kind"]
     else:
         status, rank = "applied", 0
         for e in events:
@@ -536,6 +604,16 @@ def cmd_log(conn, a):
     app = conn.execute("SELECT * FROM applications WHERE id = ?", (a.id,)).fetchone()
     if not app:
         sys.exit(f"error: no application #{a.id}")
+    # `note` is a human act, deliberately outside the transition gate (see
+    # transitions.py) -- always allowed, terminal or not, since it never
+    # changes status. Everything else goes through the same legality check
+    # that binds the classifier, so a manual `jt log` can't silently do what
+    # a confidently-wrong model is forbidden from doing.
+    if a.kind != "note" and not a.force:
+        current = derive(conn, app)["status"]
+        ok, reason = is_legal(current, a.kind)
+        if not ok:
+            sys.exit(f"error: {reason}\n  pass --force to log it anyway (for a deliberate manual correction)")
     try:
         conn.execute(
             "INSERT INTO events (application_id, occurred_on, kind, evidence) "
@@ -697,7 +775,10 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("log", help="append an event")
     s.add_argument("id", type=int)
     s.add_argument("kind", choices=sorted(EVENT_KINDS))
-    s.add_argument("--on"); s.add_argument("--note"); s.set_defaults(fn=cmd_log)
+    s.add_argument("--on"); s.add_argument("--note")
+    s.add_argument("--force", action="store_true",
+                    help="log even if illegal per transitions.py (deliberate manual correction)")
+    s.set_defaults(fn=cmd_log)
 
     s = sub.add_parser("show", help="full history for one application")
     s.add_argument("id", type=int); s.set_defaults(fn=cmd_show)

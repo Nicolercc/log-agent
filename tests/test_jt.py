@@ -384,3 +384,161 @@ def test_resolve_can_link_to_event(conn):
     assert row["resolved"] == 1
     assert row["resolved_event_id"] == event_id
     assert row["resolved_note"] == "handled"
+
+
+# --------------------------------------------------------------------------
+# derive() -- terminal tie-break must use insertion order, not occurred_on
+# --------------------------------------------------------------------------
+
+def test_backdated_correction_overrides_an_earlier_dated_terminal_event(conn):
+    """A correction is appended after the fact and is often dated to when it
+    actually happened -- which can be earlier than the mistake it corrects.
+    The most recently APPENDED terminal event must win, not the one with the
+    latest occurred_on, or the correction is silently invisible."""
+    app = add_app(conn)
+    add_event(conn, app["id"], "rejected", "2026-08-10")
+    add_event(conn, app["id"], "withdrawn", "2026-08-09")  # entered second, dated earlier
+    d = jt.derive(conn, app, today=date(2026, 8, 15))
+    assert d["status"] == "withdrawn"
+
+
+# --------------------------------------------------------------------------
+# cmd_log -- transitions.py must gate manual entry too, not just classify.py
+# --------------------------------------------------------------------------
+
+def test_log_refuses_an_illegal_transition(conn):
+    app = add_app(conn)
+    add_event(conn, app["id"], "rejected", "2026-08-05")
+    parser = jt.build_parser()
+    args = parser.parse_args(["log", str(app["id"]), "onsite"])
+    with pytest.raises(SystemExit, match="terminal"):
+        jt.cmd_log(conn, args)
+    assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 1
+
+
+def test_log_force_overrides_an_illegal_transition(conn):
+    app = add_app(conn)
+    add_event(conn, app["id"], "rejected", "2026-08-05")
+    parser = jt.build_parser()
+    args = parser.parse_args(["log", str(app["id"]), "onsite", "--force"])
+    jt.cmd_log(conn, args)
+    assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 2
+
+
+def test_log_note_is_exempt_from_the_transition_gate(conn):
+    """note is deliberately excluded from transitions.py (see its docstring)
+    because it's a human act with no bearing on status -- it must stay legal
+    even on a terminal application, without needing --force."""
+    app = add_app(conn)
+    add_event(conn, app["id"], "rejected", "2026-08-05")
+    parser = jt.build_parser()
+    args = parser.parse_args(["log", str(app["id"]), "note", "--note", "closed the loop"])
+    jt.cmd_log(conn, args)
+    assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 2
+
+
+def test_log_allows_a_legal_transition_without_force(conn):
+    app = add_app(conn)
+    parser = jt.build_parser()
+    args = parser.parse_args(["log", str(app["id"]), "screen"])
+    jt.cmd_log(conn, args)
+    assert jt.derive(conn, app)["status"] == "screen"
+
+
+# --------------------------------------------------------------------------
+# Migration -- must be atomic and must not silently drop invalid legacy rows
+# --------------------------------------------------------------------------
+
+def _make_legacy_db(path, extra_sql=""):
+    legacy = sqlite3.connect(path)
+    legacy.executescript(f"""
+        CREATE TABLE applications (
+            id INTEGER PRIMARY KEY, company TEXT NOT NULL, role TEXT NOT NULL,
+            lane TEXT NOT NULL, applied_on DATE NOT NULL, source TEXT,
+            contact_email TEXT, url TEXT, notes TEXT,
+            UNIQUE (company, role, applied_on));
+        CREATE TABLE events (
+            id INTEGER PRIMARY KEY,
+            application_id INTEGER NOT NULL
+                REFERENCES applications(id) ON DELETE CASCADE,
+            occurred_on DATE NOT NULL, kind TEXT NOT NULL,
+            gmail_msg_id TEXT UNIQUE, confidence REAL, evidence TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')));
+        INSERT INTO applications (company, role, lane, applied_on)
+            VALUES ('Acme','Engineer','swe','2026-08-03');
+        {extra_sql}
+    """)
+    legacy.commit()
+    legacy.close()
+
+
+def test_migration_refuses_a_legacy_kind_unknown_to_event_kinds(tmp_path, monkeypatch):
+    path = tmp_path / "legacy.db"
+    _make_legacy_db(path, """
+        INSERT INTO events (application_id, occurred_on, kind)
+            VALUES (1,'2026-08-05','phone_screen');
+    """)
+    monkeypatch.setenv("JT_DB", str(path))
+    with pytest.raises(RuntimeError, match="phone_screen"):
+        jt.connect()
+    # The refusal must roll the whole attempt back -- database untouched,
+    # not left half-migrated with the data stranded in events_legacy.
+    raw = sqlite3.connect(path)
+    tables = {r[0] for r in raw.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    assert "events_legacy" not in tables
+    assert raw.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 1
+    assert raw.execute("SELECT kind FROM events").fetchone()[0] == "phone_screen"
+    raw.close()
+
+
+def test_migration_is_atomic_across_a_simulated_mid_run_crash(tmp_path, monkeypatch):
+    path = tmp_path / "legacy.db"
+    _make_legacy_db(path, """
+        INSERT INTO events (application_id, occurred_on, kind)
+            VALUES (1,'2026-08-05','screen');
+        INSERT INTO events (application_id, occurred_on, kind)
+            VALUES (1,'2026-08-06','onsite');
+    """)
+    monkeypatch.setenv("JT_DB", str(path))
+
+    leaked = {}
+
+    def crashing_migrate(conn):
+        leaked["conn"] = conn
+        conn.commit()
+        old = conn.isolation_level
+        conn.isolation_level = None
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("ALTER TABLE events RENAME TO events_legacy")
+        conn.execute(jt.EVENTS_DDL)
+        conn.isolation_level = old
+        raise RuntimeError("simulated crash mid-migration")
+
+    with monkeypatch.context() as m:
+        m.setattr(jt, "_migrate_v1_to_v2", crashing_migrate)
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            jt.connect()
+    # A real crash means the OS reclaims the file lock on process exit; here
+    # we close the connection to release it the same way, without ever
+    # calling commit() -- the pending transaction rolls back on close, same
+    # as it would on an unclean process death.
+    leaked["conn"].close()
+
+    raw = sqlite3.connect(path)
+    tables = {r[0] for r in raw.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    assert tables == {"applications", "events", "event_kinds"}
+    assert raw.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 2
+    raw.close()
+
+    # Real _migrate_v1_to_v2 is back in effect here -- retry should recover cleanly.
+    conn = jt.connect()
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 2
+        kinds = {r[0] for r in conn.execute("SELECT kind FROM events").fetchall()}
+        assert kinds == {"screen", "onsite"}
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            conn.execute("DELETE FROM events")
+    finally:
+        conn.close()
