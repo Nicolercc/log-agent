@@ -49,10 +49,11 @@ Usage:
 
 import argparse
 import csv
+import json
 import os
 import sqlite3
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from transitions import is_legal
@@ -109,6 +110,17 @@ WEIGHTS = {
     "quiet_day": -0.25,
     # After one nudge and fifteen quiet business days, close it out.
     "closeout": -10.0,
+}
+
+DEFAULT_REVIEW_QUEUE_ALERT_THRESHOLD = 1
+DEFAULT_REVIEW_AGE_ALERT_DAYS = 2
+DEFAULT_CLASSIFY_FAILURE_ALERT_THRESHOLD = 3
+CLASSIFY_FAILURE_EVENTS = {"final_model_exhaustion", "non_retryable_api_failure", "failure"}
+CLASSIFY_RECOVERY_EVENTS = {
+    "healthy_zero_message_run",
+    "successful_processed_run",
+    "malformed_classifier_output",
+    "success",
 }
 
 
@@ -450,6 +462,115 @@ def pending_reviews(conn) -> int:
         "SELECT COUNT(*) FROM review_queue WHERE resolved = 0").fetchone()[0]
 
 
+def classify_log_path() -> Path:
+    return Path(os.environ.get("JT_LOG_DIR", str(Path.home() / ".jobtrack" / "logs"))) / "jt-classify.jsonl"
+
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except ValueError:
+        sys.exit(f"error: {name} must be an integer")
+
+
+def _parse_created_at(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace(" ", "T"))
+
+
+def _age_days(created_at: str, now: datetime | None = None) -> int:
+    now = now or datetime.now(timezone.utc).replace(tzinfo=None)
+    created = _parse_created_at(created_at)
+    return max(0, (now.date() - created.date()).days)
+
+
+def review_queue_stats(conn, now: datetime | None = None) -> dict:
+    row = conn.execute(
+        """SELECT COUNT(*) AS total, MIN(created_at) AS oldest_created_at
+           FROM review_queue
+           WHERE resolved = 0"""
+    ).fetchone()
+    oldest = row["oldest_created_at"]
+    age = _age_days(oldest, now) if oldest else 0
+    return {"total": row["total"], "oldest_created_at": oldest, "oldest_age_days": age}
+
+
+def _read_classify_log_events(path: Path, limit: int = 1000) -> list[dict]:
+    if not path.exists():
+        return []
+    lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()[-limit:]
+    rows = []
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if row.get("component") == "jt-classify":
+            rows.append(row)
+    return rows
+
+
+def classify_failure_stats(log_path: Path) -> dict:
+    rows = _read_classify_log_events(log_path)
+    since_recovery: list[dict] = []
+    consecutive_failures = 0
+    for row in rows:
+        event = row.get("event")
+        if event in CLASSIFY_RECOVERY_EVENTS:
+            since_recovery = []
+            consecutive_failures = 0
+        elif event in CLASSIFY_FAILURE_EVENTS:
+            since_recovery.append(row)
+            consecutive_failures += 1
+    exhaustion = next((r for r in reversed(since_recovery)
+                       if r.get("event") == "final_model_exhaustion"), None)
+    latest_failure = since_recovery[-1] if since_recovery else None
+    return {
+        "consecutive_failures": consecutive_failures,
+        "has_classifier_exhaustion": exhaustion is not None,
+        "latest_exhaustion": exhaustion,
+        "latest_failure": latest_failure,
+        "log_path": str(log_path),
+    }
+
+
+def review_alerts(conn, *, log_path: Path | None = None, now: datetime | None = None,
+                  queue_threshold: int | None = None, age_days: int | None = None,
+                  failure_threshold: int | None = None) -> tuple[list[str], dict]:
+    queue_threshold = queue_threshold if queue_threshold is not None else _int_env(
+        "JT_REVIEW_ALERT_THRESHOLD", DEFAULT_REVIEW_QUEUE_ALERT_THRESHOLD)
+    age_days = age_days if age_days is not None else _int_env(
+        "JT_REVIEW_AGE_ALERT_DAYS", DEFAULT_REVIEW_AGE_ALERT_DAYS)
+    failure_threshold = failure_threshold if failure_threshold is not None else _int_env(
+        "JT_CLASSIFY_FAILURE_ALERT_THRESHOLD", DEFAULT_CLASSIFY_FAILURE_ALERT_THRESHOLD)
+    log_path = log_path or classify_log_path()
+
+    review_stats = review_queue_stats(conn, now)
+    failure_stats = classify_failure_stats(log_path)
+    alerts = []
+    if review_stats["total"] >= queue_threshold:
+        alerts.append(f"total_review_queue_size={review_stats['total']} threshold={queue_threshold}")
+    if review_stats["total"] and review_stats["oldest_age_days"] >= age_days:
+        alerts.append(
+            f"oldest_review_item_age_days={review_stats['oldest_age_days']} threshold={age_days} "
+            f"oldest_created_at={review_stats['oldest_created_at']}"
+        )
+    if failure_stats["has_classifier_exhaustion"]:
+        row = failure_stats["latest_exhaustion"] or {}
+        alerts.append(
+            "classifier_exhaustion_event "
+            f"attempt_count={row.get('attempt_count')} status_code={row.get('status_code')} "
+            f"error_type={row.get('error_type')}"
+        )
+    if failure_stats["consecutive_failures"] >= failure_threshold:
+        row = failure_stats["latest_failure"] or {}
+        alerts.append(
+            f"repeated_classify_failures={failure_stats['consecutive_failures']} threshold={failure_threshold} "
+            f"latest_event={row.get('event')} status_code={row.get('status_code')} "
+            f"error_type={row.get('error_type')}"
+        )
+    return alerts, {"review": review_stats, "classify": failure_stats}
+
+
 # --------------------------------------------------------------------------
 # Rendering
 # --------------------------------------------------------------------------
@@ -703,6 +824,8 @@ def cmd_backup(conn, a):
 
 
 def cmd_review(conn, a):
+    if getattr(a, "review_cmd", None) == "stale":
+        return cmd_review_stale(conn, a)
     rows = conn.execute(
         "SELECT * FROM review_queue WHERE resolved = 0 ORDER BY id").fetchall()
     if not rows:
@@ -713,6 +836,38 @@ def cmd_review(conn, a):
         print(f"  [{r['id']}] {r['reason']}\n      {r['proposed_json']}")
     print(f"\n  {len(rows)} pending. Resolve with: jt log <app_id> <kind>, "
           f"then jt resolve <queue_id>\n")
+
+
+def cmd_review_stale(conn, a):
+    alerts, stats = review_alerts(
+        conn,
+        log_path=Path(a.log) if a.log else None,
+        queue_threshold=a.queue_threshold,
+        age_days=a.age_days,
+        failure_threshold=a.failure_threshold,
+    )
+    review = stats["review"]
+    classify = stats["classify"]
+    print(
+        "review health: "
+        f"total={review['total']} "
+        f"oldest_age_days={review['oldest_age_days']} "
+        f"oldest_created_at={review['oldest_created_at'] or '-'}"
+    )
+    print(
+        "classify health: "
+        f"consecutive_failures={classify['consecutive_failures']} "
+        f"classifier_exhaustion={'yes' if classify['has_classifier_exhaustion'] else 'no'} "
+        f"log={classify['log_path']}"
+    )
+    if alerts:
+        for alert in alerts:
+            print(f"ALERT {alert}")
+        if not a.no_fail:
+            sys.exit(1)
+        print("review health alerts present")
+        return
+    print("review health OK")
 
 
 def cmd_resolve(conn, a):
@@ -794,6 +949,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("dir"); s.set_defaults(fn=cmd_backup)
 
     s = sub.add_parser("review", help="pending classifier proposals (Phase 3)")
+    s.add_argument("review_cmd", nargs="?", choices=["stale"])
+    s.add_argument("--queue-threshold", type=int, default=None)
+    s.add_argument("--age-days", type=int, default=None)
+    s.add_argument("--failure-threshold", type=int, default=None)
+    s.add_argument("--log")
+    s.add_argument("--no-fail", action="store_true")
     s.set_defaults(fn=cmd_review)
 
     s = sub.add_parser("resolve", help="mark a review item handled")

@@ -1,23 +1,53 @@
 # Secrets. This file exists before the first commit, deliberately.
+#
+# Google's actual OAuth-client download filename is
+# client_secret_<id>.apps.googleusercontent.com.json -- it does NOT end in
+# ".client_secret.json", so a suffix-only glob misses it. Cover it by
+# substring instead of suffix, and cover credentials.json's non-exact
+# variants (copies, backups) the same way.
 credentials/
+credentials.json
+credentials*.json
+client_secret*.json
+*client_secret*.json
+*oauth*client*.json
 tokens/
 token.json
-*.client_secret.json
+token*.json
+*.pem
+*.key
 .env
-.env.local
+.env.*
+!.env.example
 
 # Local data. Your job search is not public.
 *.db
 *.db-journal
+*.db-wal
+*.db-shm
 *.sqlite
+*.sqlite3
+*.sqlite-journal
 *.classify.lock
 backups/
 today.txt
 pursuit*.csv
 
+# Gmail raw exports/dumps -- should never exist outside raw_messages in the
+# (already-ignored) sqlite db, but glob them anyway.
+*.eml
+*.mbox
+
 # Eval fixtures made from real mail. Only the redacted example is tracked.
 evals/fixtures.jsonl
 evals/raw/
+
+# Rendered launchd plists are machine-local (this clone's absolute path,
+# this account's home dir). Only the *.plist.template files are product.
+# install-launchd.sh writes rendered output to ~/Library/LaunchAgents, but
+# ignore it here too in case anyone renders into the repo tree by hand.
+launchd/*.plist
+!launchd/*.plist.template
 
 # Python
 __pycache__/

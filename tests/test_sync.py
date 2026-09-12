@@ -1,4 +1,5 @@
 from datetime import date, datetime, timezone
+import json
 
 import pytest
 
@@ -84,6 +85,80 @@ class Service:
 
     def users(self):
         return Users(self.messages_obj)
+
+
+def fake_google_clients():
+    class Request:
+        pass
+
+    class Credentials:
+        @staticmethod
+        def from_authorized_user_file(path, scopes):
+            raise AssertionError("token should not be loaded")
+
+    class Flow:
+        pass
+
+    class WSGITimeoutError(Exception):
+        pass
+
+    def build(*args, **kwargs):
+        raise AssertionError("service should not be built")
+
+    return Request, Credentials, Flow, WSGITimeoutError, build
+
+
+def test_unattended_sync_fails_fast_when_token_is_missing(tmp_path, monkeypatch):
+    client = tmp_path / "client.json"
+    client.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("JT_UNATTENDED", "1")
+    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT", str(client))
+    monkeypatch.setenv("GOOGLE_TOKEN_PATH", str(tmp_path / "missing-token.json"))
+    monkeypatch.setattr(sync, "_require_google_clients", fake_google_clients)
+
+    with pytest.raises(SystemExit, match="GOOGLE_TOKEN_PATH does not exist"):
+        sync.build_gmail_service()
+
+
+def test_google_client_path_must_be_absolute(monkeypatch):
+    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT", "relative-client.json")
+    monkeypatch.setattr(sync, "_require_google_clients", fake_google_clients)
+
+    with pytest.raises(
+        SystemExit, match="GOOGLE_OAUTH_CLIENT must be an absolute path"
+    ):
+        sync.build_gmail_service()
+
+
+def test_oauth_timeout_defaults_to_five_minutes(monkeypatch):
+    monkeypatch.delenv("GOOGLE_OAUTH_TIMEOUT_SECONDS", raising=False)
+    assert sync.oauth_timeout_seconds() == 300
+
+
+def test_oauth_timeout_can_be_disabled(monkeypatch):
+    monkeypatch.setenv("GOOGLE_OAUTH_TIMEOUT_SECONDS", "0")
+    assert sync.oauth_timeout_seconds() is None
+
+
+def test_oauth_timeout_must_be_an_integer(monkeypatch):
+    monkeypatch.setenv("GOOGLE_OAUTH_TIMEOUT_SECONDS", "soon")
+    with pytest.raises(
+        SystemExit, match="GOOGLE_OAUTH_TIMEOUT_SECONDS must be an integer"
+    ):
+        sync.oauth_timeout_seconds()
+
+
+def test_sync_structured_log_writes_jsonl(tmp_path, monkeypatch):
+    log_path = tmp_path / "sync.jsonl"
+    monkeypatch.setattr(sync, "LOG_PATH", log_path)
+
+    sync._structured_log("success", exit_status=0, seen=2, inserted=1)
+
+    row = json.loads(log_path.read_text(encoding="utf-8"))
+    assert row["component"] == "jt-sync"
+    assert row["event"] == "success"
+    assert row["exit_status"] == 0
+    assert row["seen"] == 2
 
 
 def test_duplicate_message_is_a_noop(conn):

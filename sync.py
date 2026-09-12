@@ -10,6 +10,7 @@ idempotency. Classification is a separate phase.
 import argparse
 import base64
 import html
+import json
 import os
 import random
 import re
@@ -27,6 +28,10 @@ DEFAULT_OVERLAP_DAYS = 2
 DEFAULT_LOOKBACK_DAYS = 30
 MAX_BODY_CHARS = 4000
 MAX_ATTEMPTS = 5
+DEFAULT_OAUTH_TIMEOUT_SECONDS = 300
+# Overridable so a second machine, a different account, or CI doesn't need
+# this literal home directory to exist. Mirrors jt.py's db_path() pattern.
+LOG_PATH = Path(os.environ.get("JT_LOG_DIR", str(Path.home() / ".jobtrack" / "logs"))) / "jt-sync.jsonl"
 
 
 @dataclass(frozen=True)
@@ -42,7 +47,7 @@ def _require_google_clients():
     try:
         from google.auth.transport.requests import Request
         from google.oauth2.credentials import Credentials
-        from google_auth_oauthlib.flow import InstalledAppFlow
+        from google_auth_oauthlib.flow import InstalledAppFlow, WSGITimeoutError
         from googleapiclient.discovery import build
     except ImportError as e:
         raise SystemExit(
@@ -50,25 +55,87 @@ def _require_google_clients():
             "  pipx install -e '.[gmail]'\n"
             f"missing import: {e.name}"
         ) from e
-    return Request, Credentials, InstalledAppFlow, build
+    return Request, Credentials, InstalledAppFlow, WSGITimeoutError, build
+
+
+def _structured_log(event: str, **fields: Any) -> None:
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "component": "jt-sync",
+        "event": event,
+        **fields,
+    }
+    with LOG_PATH.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, sort_keys=True) + "\n")
+
+
+def _absolute_path_env(name: str, default: str | None = None) -> Path:
+    raw = os.environ.get(name, default)
+    if not raw:
+        raise SystemExit(f"error: set {name} to an absolute path")
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        raise SystemExit(f"error: {name} must be an absolute path")
+    return path
+
+
+def _is_unattended() -> bool:
+    return os.environ.get("JT_UNATTENDED") == "1"
 
 
 def build_gmail_service():
-    Request, Credentials, InstalledAppFlow, build = _require_google_clients()
-    client_path = os.environ.get("GOOGLE_OAUTH_CLIENT")
-    if not client_path:
-        raise SystemExit("error: set GOOGLE_OAUTH_CLIENT to your OAuth client JSON")
-    token_path = Path(os.environ.get("GOOGLE_TOKEN_PATH", "~/.jobtrack/token.json")).expanduser()
+    (
+        Request,
+        Credentials,
+        InstalledAppFlow,
+        WSGITimeoutError,
+        build,
+    ) = _require_google_clients()
+    client_path = _absolute_path_env("GOOGLE_OAUTH_CLIENT")
+    if not client_path.is_file():
+        raise SystemExit(f"error: GOOGLE_OAUTH_CLIENT does not exist: {client_path}")
+    token_path = _absolute_path_env(
+        "GOOGLE_TOKEN_PATH", str(Path.home() / ".jobtrack" / "token.json"))
+    if _is_unattended() and not token_path.is_file():
+        raise SystemExit(
+            "error: GOOGLE_TOKEN_PATH does not exist; run jt-sync once interactively "
+            "before starting unattended automation"
+        )
     creds = None
     if token_path.exists():
         token_path.chmod(0o600)
         creds = Credentials.from_authorized_user_file(str(token_path), [GMAIL_SCOPE])
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
+            try:
+                creds.refresh(Request())
+            except Exception as e:
+                if "invalid_grant" in str(e):
+                    raise SystemExit(
+                        "error: Gmail token refresh failed with invalid_grant; "
+                        "regenerate GOOGLE_TOKEN_PATH before unattended sync can continue"
+                    ) from e
+                raise
         else:
-            flow = InstalledAppFlow.from_client_secrets_file(client_path, [GMAIL_SCOPE])
-            creds = flow.run_local_server(port=0)
+            if _is_unattended():
+                raise SystemExit(
+                    "error: Gmail credentials are not valid for unattended use; "
+                    "run jt-sync interactively to refresh GOOGLE_TOKEN_PATH"
+                )
+            flow = InstalledAppFlow.from_client_secrets_file(str(client_path), [GMAIL_SCOPE])
+            try:
+                creds = flow.run_local_server(
+                    port=0,
+                    timeout_seconds=oauth_timeout_seconds(),
+                )
+            except WSGITimeoutError as e:
+                raise SystemExit(
+                    "error: Gmail OAuth did not complete before the local "
+                    "authorization server timed out. Confirm the Google Cloud "
+                    "OAuth client allows this Gmail account, then rerun jt-sync "
+                    "interactively."
+                ) from e
         token_path.parent.mkdir(parents=True, exist_ok=True)
         token_path.write_text(creds.to_json(), encoding="utf-8")
         token_path.chmod(0o600)
@@ -188,6 +255,17 @@ def overlap_days() -> int:
         raise SystemExit("error: GMAIL_OVERLAP_DAYS must be an integer")
 
 
+def oauth_timeout_seconds() -> int | None:
+    raw = os.environ.get("GOOGLE_OAUTH_TIMEOUT_SECONDS")
+    if raw is None:
+        return DEFAULT_OAUTH_TIMEOUT_SECONDS
+    try:
+        seconds = int(raw)
+    except ValueError:
+        raise SystemExit("error: GOOGLE_OAUTH_TIMEOUT_SECONDS must be an integer")
+    return seconds if seconds > 0 else None
+
+
 def gmail_query(label: str, since_day: str) -> str:
     return f"label:{label} after:{since_day.replace('-', '/')}"
 
@@ -268,16 +346,38 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
-    conn = jt.connect()
+    _structured_log("start", dry_run=args.dry_run, since=args.since)
+    conn = None
     try:
+        conn = jt.connect()
         seen, inserted = sync_messages(
             conn, build_gmail_service(), since=args.since, dry_run=args.dry_run)
+    except BaseException as e:
+        code = e.code if isinstance(e, SystemExit) else 1
+        _structured_log(
+            "failure",
+            dry_run=args.dry_run,
+            since=args.since,
+            exit_status=code if isinstance(code, int) else 1,
+            error_type=type(e).__name__,
+            error=str(e),
+        )
+        raise
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
     if args.dry_run:
         print(f"would inspect {seen} message(s)")
     else:
         print(f"inspected {seen}, inserted {inserted}")
+    _structured_log(
+        "success",
+        dry_run=args.dry_run,
+        since=args.since,
+        exit_status=0,
+        seen=seen,
+        inserted=inserted,
+    )
 
 
 if __name__ == "__main__":

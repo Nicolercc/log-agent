@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>dev.nicole.jt.daily-stale</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__REPO_DIR__/scripts/jt-daily-stale.sh</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>JT_PYTHON</key>
+    <string>__REPO_DIR__/.venv/bin/python</string>
+    <key>JT_UNATTENDED</key>
+    <string>1</string>
+    <key>GOOGLE_OAUTH_CLIENT</key>
+    <string>__JOBTRACK_HOME__/google_oauth_client.json</string>
+    <key>GOOGLE_TOKEN_PATH</key>
+    <string>__JOBTRACK_HOME__/token.json</string>
+    <key>GMAIL_LABEL</key>
+    <string>jobsearch</string>
+    <key>JT_REVIEW_ALERT_THRESHOLD</key>
+    <string>1</string>
+  </dict>
+
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>8</integer>
+    <key>Minute</key>
+    <integer>30</integer>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>__JOBTRACK_HOME__/logs/dev.nicole.jt.daily-stale.out.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>__JOBTRACK_HOME__/logs/dev.nicole.jt.daily-stale.err.log</string>
+</dict>
+</plist>

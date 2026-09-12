@@ -7,7 +7,7 @@ is a suite you learn to ignore.
 """
 
 import sqlite3
-from datetime import date
+from datetime import date, datetime
 
 import pytest
 
@@ -384,6 +384,83 @@ def test_resolve_can_link_to_event(conn):
     assert row["resolved"] == 1
     assert row["resolved_event_id"] == event_id
     assert row["resolved_note"] == "handled"
+
+
+def test_review_stale_alerts_on_queue_size_and_oldest_age(conn, tmp_path, capsys):
+    conn.execute(
+        """INSERT INTO review_queue (gmail_msg_id, proposed_json, reason, created_at)
+           VALUES ('m1', '{}', 'needs human', '2026-08-01 00:00:00')"""
+    )
+    conn.execute(
+        """INSERT INTO review_queue (gmail_msg_id, proposed_json, reason, created_at)
+           VALUES ('m2', '{}', 'needs human', '2026-08-03 00:00:00')"""
+    )
+    conn.commit()
+
+    alerts, stats = jt.review_alerts(
+        conn,
+        log_path=tmp_path / "missing.jsonl",
+        now=datetime(2026, 8, 5, 12, 0, 0),
+        queue_threshold=2,
+        age_days=3,
+        failure_threshold=3,
+    )
+
+    assert stats["review"]["total"] == 2
+    assert stats["review"]["oldest_age_days"] == 4
+    assert any("total_review_queue_size=2" in alert for alert in alerts)
+    assert any("oldest_review_item_age_days=4" in alert for alert in alerts)
+
+    parser = jt.build_parser()
+    args = parser.parse_args([
+        "review", "stale", "--queue-threshold", "2", "--age-days", "3",
+        "--log", str(tmp_path / "missing.jsonl"),
+    ])
+    with pytest.raises(SystemExit) as excinfo:
+        jt.cmd_review(conn, args)
+    assert excinfo.value.code == 1
+    out = capsys.readouterr().out
+    assert "ALERT total_review_queue_size=2" in out
+    assert "ALERT oldest_review_item_age_days=4" in out
+
+
+def test_review_stale_alerts_on_classifier_exhaustion(conn, tmp_path):
+    log_path = tmp_path / "jt-classify.jsonl"
+    log_path.write_text(
+        '\n'.join([
+            '{"component":"jt-classify","event":"successful_processed_run"}',
+            '{"component":"jt-classify","event":"final_model_exhaustion",'
+            '"attempt_count":5,"status_code":500,"error_type":"ServerError"}',
+        ]),
+        encoding="utf-8",
+    )
+
+    alerts, stats = jt.review_alerts(
+        conn, log_path=log_path, queue_threshold=99, age_days=99, failure_threshold=3)
+
+    assert stats["classify"]["has_classifier_exhaustion"] is True
+    assert any("classifier_exhaustion_event" in alert for alert in alerts)
+    assert any("status_code=500" in alert for alert in alerts)
+
+
+def test_review_stale_alerts_on_repeated_classify_failures(conn, tmp_path):
+    log_path = tmp_path / "jt-classify.jsonl"
+    log_path.write_text(
+        '\n'.join([
+            '{"component":"jt-classify","event":"successful_processed_run"}',
+            '{"component":"jt-classify","event":"non_retryable_api_failure",'
+            '"attempt_count":1,"status_code":400,"error_type":"BadRequest"}',
+            '{"component":"jt-classify","event":"failure",'
+            '"attempt_count":0,"status_code":null,"error_type":"RuntimeError"}',
+        ]),
+        encoding="utf-8",
+    )
+
+    alerts, stats = jt.review_alerts(
+        conn, log_path=log_path, queue_threshold=99, age_days=99, failure_threshold=2)
+
+    assert stats["classify"]["consecutive_failures"] == 2
+    assert any("repeated_classify_failures=2" in alert for alert in alerts)
 
 
 # --------------------------------------------------------------------------

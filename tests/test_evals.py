@@ -1,3 +1,4 @@
+import classify
 from evals.run import load_fixtures, run_eval
 
 
@@ -12,27 +13,27 @@ def test_eval_harness_runs_against_redacted_example():
 
 
 def test_eval_counts_wrong_kind_as_misclassification():
+    class ToolUseBlock:
+        type = "tool_use"
+        name = classify.TOOL_NAME
+        input = {"proposals": [{
+            "gmail_msg_id": "fx",
+            "company": "Company A",
+            "role_hint": "Backend Engineer",
+            "kind": "screen",
+            "occurred_on": "2026-08-02",
+            "confidence": 0.99,
+            "evidence": "we received your application",
+        }]}
+
     class FakeClient:
         class Messages:
             def create(self, **kwargs):
                 class Response:
                     pass
 
-                class Content:
-                    pass
-
                 r = Response()
-                c = Content()
-                c.text = """[{
-                    "gmail_msg_id": "fx",
-                    "company": "Company A",
-                    "role_hint": "Backend Engineer",
-                    "kind": "screen",
-                    "occurred_on": "2026-08-02",
-                    "confidence": 0.99,
-                    "evidence": "we received your application"
-                }]"""
-                r.content = [c]
+                r.content = [ToolUseBlock()]
                 return r
 
         @property
