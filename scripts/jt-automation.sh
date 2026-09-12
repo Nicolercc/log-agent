@@ -128,11 +128,11 @@ main() {
   if ((DRY_RUN)); then
     run_step "sync dry-run" /usr/bin/env JT_UNATTENDED=1 "$py" "${REPO_DIR}/sync.py" --dry-run
     run_step "classify dry-run" /usr/bin/env JT_UNATTENDED=1 "$py" "${REPO_DIR}/classify.py" --dry-run
-    run_step "review health dry-run" /usr/bin/env JT_UNATTENDED=1 "$py" "${REPO_DIR}/jt.py" review stale
+    run_step "review health dry-run" /usr/bin/env JT_UNATTENDED=1 "$py" "${REPO_DIR}/jt.py" review stale --no-fail
   else
     run_step "sync" /usr/bin/env JT_UNATTENDED=1 "$py" "${REPO_DIR}/sync.py"
     run_step "classify" /usr/bin/env JT_UNATTENDED=1 "$py" "${REPO_DIR}/classify.py"
-    run_step "review health" /usr/bin/env JT_UNATTENDED=1 "$py" "${REPO_DIR}/jt.py" review stale
+    run_step "review health" /usr/bin/env JT_UNATTENDED=1 "$py" "${REPO_DIR}/jt.py" review stale --no-fail
   fi
 
   run_step "stale summary" /usr/bin/env JT_UNATTENDED=1 "$py" "${REPO_DIR}/jt.py" stale

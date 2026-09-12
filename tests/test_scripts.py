@@ -140,6 +140,36 @@ def test_jt_automation_preserves_classify_exit_status(tmp_path):
     assert result.returncode == 42
 
 
+def test_jt_automation_keeps_review_alerts_nonfatal(tmp_path):
+    fake_python = tmp_path / "fake-python"
+    fake_python.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -eu\n"
+        "case \"$*\" in\n"
+        "  *'review stale --no-fail'*) echo 'ALERT total_review_queue_size=1 threshold=1'; exit 0 ;;\n"
+        "  *'review stale'*) echo 'ALERT total_review_queue_size=1 threshold=1'; exit 7 ;;\n"
+        "  *) exit 0 ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+
+    env = os.environ.copy()
+    env["JT_PYTHON"] = str(fake_python)
+    env["JT_LOG_DIR"] = str(tmp_path / "logs")
+
+    result = subprocess.run(
+        ["scripts/jt-automation.sh", "--dry-run"],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+
+
 def test_jt_automation_loads_local_env_file_for_launchd(tmp_path):
     env_file = tmp_path / "jt.env"
     env_file.write_text("ANTHROPIC_API_KEY=from-jt-env\n", encoding="utf-8")

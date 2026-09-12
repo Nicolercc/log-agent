@@ -3,15 +3,17 @@
 Local unattended automation is handled by launchd calling thin shell wrappers
 around the existing jt entry points. The wrappers do not change tracker
 behavior: they run sync, then classification, then `jt review stale`, then
-the stale summary. The review-health gate turns classifier/review drift into
-an explicit launchd-visible failure instead of a quiet growing queue.
+the stale summary. Hard command failures stay launchd-visible; routine
+review-health alerts stay visible in logs and in the daily notification
+without making the hourly job look crashed.
 
 ## Files
 
-- `scripts/jt-automation.sh` -- runs sync + classify + `jt review stale`
-  (+ dry-run variants). No notification side effects -- a failure here
-  surfaces as this script's own non-zero exit, visible to launchd/log
-  inspection, not a push notification.
+- `scripts/jt-automation.sh` -- runs sync + classify + `jt review stale
+  --no-fail` (+ dry-run variants). No notification side effects -- hard
+  command failures surface as this script's own non-zero exit, visible to
+  launchd/log inspection, while ordinary review alerts are logged without
+  failing the hourly job.
 - `scripts/jt-daily-stale.sh` -- runs the automation script, then `jt
   stale` and `jt review stale --no-fail`, then a single macOS notification
   if either a hard failure or a review-health alert is present. This is
@@ -142,11 +144,11 @@ Run the review health gate directly:
 
 `jt review stale` checks unresolved review queue size, oldest unresolved
 review age, classifier exhaustion events in `jt-classify.jsonl`, and
-repeated classify failures. It exits non-zero when an alert is present;
-`jt-automation.sh` uses that exit code so launchd records the run as
-failed. For a human-readable check that should never fail a surrounding
-shell script, use `jt review stale --no-fail` -- this is what
-`jt-daily-stale.sh` uses.
+repeated classify failures. It exits non-zero when an alert is present.
+For a human-readable check that should never fail a surrounding shell
+script, use `jt review stale --no-fail` -- this is what the launchd
+wrappers use when they want visibility without treating queue hygiene as a
+hard crash.
 
 ## Alerting
 
@@ -157,9 +159,10 @@ Two layers, deliberately not the same thing:
   (the classify step's own exit status, preserved verbatim) -- that
   failure is visible within the hour via `jt-automation.log` or `launchctl
   print`/exit-status inspection, independent of any threshold. The
-  `jt review stale` step it also runs mostly catches a *different* thing:
-  review-queue buildup on runs where classify itself is technically
-  healthy.
+  `jt review stale --no-fail` step it also runs mostly catches a
+  *different* thing: review-queue buildup on runs where classify itself is
+  technically healthy. Those alerts are logged hourly but not treated as
+  process crashes.
 - **`jt-daily-stale.sh` (once/day at 8:30 AM)**: the only thing that
   actually pages via a macOS notification. It runs its own separate
   `jt-automation.sh` invocation, then unconditionally checks health and
@@ -233,8 +236,9 @@ launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/dev.nicole.jt.daily-stale.
 - `dev.nicole.jt.sync` runs hourly and at load. Each run executes sync,
   classify, review-health checks, and then the stale summary. If classify
   exits non-zero, the wrapper preserves that exact exit status. If
-  `jt review stale` finds alerts, the wrapper exits non-zero so launchd and
-  the wrapper log show the automation is unhealthy.
+  `jt review stale --no-fail` finds alerts, the wrapper logs them and
+  leaves the daily notification job to page once with human-readable
+  wording.
 - `dev.nicole.jt.daily-stale` runs daily at 8:30 AM.
 
 Both scripts write failures to `$JT_LOG_DIR` (default `~/.jobtrack/logs`).
