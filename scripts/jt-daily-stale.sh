@@ -3,6 +3,20 @@ set -Eeuo pipefail
 
 # Derived, not hardcoded -- see jt-automation.sh for why.
 readonly REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+readonly DEFAULT_ENV_FILE="${HOME}/.jobtrack/jt.env"
+
+load_env_file() {
+  local env_file="${JT_ENV_FILE:-$DEFAULT_ENV_FILE}"
+  if [[ -f "$env_file" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "$env_file"
+    set +a
+  fi
+}
+
+load_env_file
+
 readonly LOG_DIR="${JT_LOG_DIR:-$HOME/.jobtrack/logs}"
 readonly LOG_FILE="${LOG_DIR}/jt-daily-stale.log"
 readonly AUTOMATION_SCRIPT="${REPO_DIR}/scripts/jt-automation.sh"

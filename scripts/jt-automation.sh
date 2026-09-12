@@ -6,6 +6,20 @@ set -Eeuo pipefail
 # launchd invokes this script by the absolute ProgramArguments path in the
 # plist, so BASH_SOURCE still resolves correctly there.
 readonly REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+readonly DEFAULT_ENV_FILE="${HOME}/.jobtrack/jt.env"
+
+load_env_file() {
+  local env_file="${JT_ENV_FILE:-$DEFAULT_ENV_FILE}"
+  if [[ -f "$env_file" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "$env_file"
+    set +a
+  fi
+}
+
+load_env_file
+
 readonly LOG_DIR="${JT_LOG_DIR:-$HOME/.jobtrack/logs}"
 readonly LOG_FILE="${LOG_DIR}/jt-automation.log"
 readonly DEFAULT_PYTHON="${REPO_DIR}/.venv/bin/python"

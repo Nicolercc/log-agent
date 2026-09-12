@@ -62,11 +62,11 @@ variable, the same pattern `jt.py` already uses for `JT_DB`:
 | Google OAuth token cache | `GOOGLE_TOKEN_PATH` | `~/.jobtrack/token.json` |
 | Python interpreter used by the shell wrappers | `JT_PYTHON` | `<repo>/.venv/bin/python` |
 | Automation's own `.jobtrack` root (used by `install-launchd.sh`) | `JT_HOME` | `~/.jobtrack` |
+| Local env file read by shell wrappers | `JT_ENV_FILE` | `~/.jobtrack/jt.env` |
 | Review queue size alert threshold | `JT_REVIEW_ALERT_THRESHOLD` | `1` |
 | Oldest unresolved review age threshold | `JT_REVIEW_AGE_ALERT_DAYS` | `2` |
 | Consecutive classify-failure alert threshold | `JT_CLASSIFY_FAILURE_ALERT_THRESHOLD` | `3` |
 | Notifier used by `jt-daily-stale.sh` (override with a fake for tests) | `JT_OSASCRIPT` | `/usr/bin/osascript` |
-| Consecutive classify failure threshold | `JT_CLASSIFY_FAILURE_ALERT_THRESHOLD` | `3` |
 
 None of these need to be set for a single-user, single-machine setup --
 they exist so a second machine, a renamed clone, or a different account
@@ -80,10 +80,26 @@ GOOGLE_TOKEN_PATH=~/.jobtrack/token.json
 ANTHROPIC_API_KEY=...
 ```
 
-launchd does not load shell startup files. Required credentials are set
-under the rendered plist's `EnvironmentVariables` key (edit the
-`.template`, not the rendered output, then re-run `install-launchd.sh
---load`), or via `launchctl setenv` before loading the jobs.
+For interactive terminal use, put those values in the repo-local `.env`
+file and source it before running `sync.py` or `classify.py`.
+
+For launchd, put the same values in a local env file outside the repo:
+
+```bash
+mkdir -p ~/.jobtrack
+chmod 700 ~/.jobtrack
+cat > ~/.jobtrack/jt.env <<'EOF'
+GOOGLE_OAUTH_CLIENT=/Users/nicolerodriguez/.jobtrack/google_oauth_client.json
+GOOGLE_TOKEN_PATH=/Users/nicolerodriguez/.jobtrack/token.json
+ANTHROPIC_API_KEY=...
+CLASSIFIER_MODEL=claude-sonnet-5
+EOF
+chmod 600 ~/.jobtrack/jt.env
+```
+
+`jt-automation.sh` and `jt-daily-stale.sh` load this file automatically
+before running Python. If a different path is needed, set `JT_ENV_FILE` in
+the launchd plist template and rerun `scripts/install-launchd.sh --load`.
 
 The launchd examples set `JT_UNATTENDED=1`. In that mode, `jt-sync` fails
 fast if `GOOGLE_TOKEN_PATH` is missing or invalid instead of trying to open
