@@ -159,6 +159,159 @@ def test_add_rejects_empty_company_or_role(conn):
 
 
 # --------------------------------------------------------------------------
+# Application candidates -- capture is never acceptance
+# --------------------------------------------------------------------------
+
+def test_connect_creates_application_candidates_additively(conn):
+    cols = {
+        r["name"] for r in conn.execute("PRAGMA table_info(application_candidates)")
+    }
+    assert {"raw_input", "source_ref", "status", "accepted_application_id"} <= cols
+    assert conn.execute("SELECT COUNT(*) FROM applications").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
+
+
+def test_capture_persists_unparseable_input(conn, capsys, monkeypatch):
+    monkeypatch.setattr(jt.sys, "stdin", type("In", (), {"read": lambda self: "???\nnot a job"})())
+    parser = jt.build_parser()
+    args = parser.parse_args(["capture"])
+
+    jt.cmd_capture(conn, args)
+
+    row = conn.execute("SELECT * FROM application_candidates").fetchone()
+    assert row["raw_input"] == "???\nnot a job"
+    assert row["status"] == "pending"
+    assert conn.execute("SELECT COUNT(*) FROM applications").fetchone()[0] == 0
+    assert "captured candidate #1" in capsys.readouterr().out
+
+
+def test_capture_reuses_source_ref_and_url_as_noop_keys(conn):
+    first, inserted = jt.insert_application_candidate(
+        conn, raw_input="same paste", source_ref="paste:1", url="https://example.com/job")
+    second, second_inserted = jt.insert_application_candidate(
+        conn, raw_input="same paste again", source_ref="paste:1")
+    third, third_inserted = jt.insert_application_candidate(
+        conn, raw_input="different paste", url="https://example.com/job")
+
+    assert (first, inserted) == (1, True)
+    assert (second, second_inserted) == (1, False)
+    assert (third, third_inserted) == (1, False)
+    assert conn.execute("SELECT COUNT(*) FROM application_candidates").fetchone()[0] == 1
+
+
+def test_capture_hashes_repeated_raw_paste_into_a_noop(conn):
+    jt.insert_application_candidate(conn, raw_input="Company | Role")
+    candidate_id, inserted = jt.insert_application_candidate(conn, raw_input="Company | Role")
+
+    assert candidate_id == 1
+    assert inserted is False
+    assert conn.execute("SELECT COUNT(*) FROM application_candidates").fetchone()[0] == 1
+
+
+def test_accept_candidate_matches_jt_add_row_shape(tmp_path, monkeypatch, capsys):
+    candidate_db = tmp_path / "candidate.db"
+    add_db = tmp_path / "add.db"
+
+    monkeypatch.setenv("JT_DB", str(candidate_db))
+    c1 = jt.connect()
+    jt.insert_application_candidate(
+        c1,
+        raw_input="Acme backend role",
+        company="Acme",
+        role="Backend Engineer",
+        lane="swe",
+        applied_on="2026-08-03",
+        contact_email="recruiter@example.com",
+        url="https://example.com/job",
+        notes="from paste",
+    )
+    parser = jt.build_parser()
+    args = parser.parse_args(["candidates", "accept", "1"])
+    jt.cmd_candidates(c1, args)
+    accepted = dict(c1.execute("SELECT * FROM applications").fetchone())
+    c1.close()
+
+    monkeypatch.setenv("JT_DB", str(add_db))
+    c2 = jt.connect()
+    args = parser.parse_args([
+        "add", "Acme", "Backend Engineer", "--lane", "swe", "--on", "2026-08-03",
+        "--source", "manual_capture", "--contact", "recruiter@example.com",
+        "--url", "https://example.com/job", "--notes", "from paste",
+    ])
+    jt.cmd_add(c2, args)
+    direct = dict(c2.execute("SELECT * FROM applications").fetchone())
+    c2.close()
+
+    accepted.pop("id")
+    direct.pop("id")
+    assert accepted == direct
+    assert "accepted candidate #1 as #1" in capsys.readouterr().out
+
+
+def test_accept_candidate_refuses_existing_application_and_names_id(conn):
+    app = add_app(conn, "Acme", "Backend Engineer", applied_on="2026-08-03")
+    jt.insert_application_candidate(
+        conn,
+        raw_input="Acme backend role",
+        company="Acme",
+        role="Backend Engineer",
+        lane="swe",
+        applied_on="2026-08-03",
+    )
+    parser = jt.build_parser()
+    args = parser.parse_args(["candidates", "accept", "1"])
+
+    with pytest.raises(SystemExit, match=f"matching application already exists as #{app['id']}"):
+        jt.cmd_candidates(conn, args)
+
+    assert conn.execute("SELECT COUNT(*) FROM applications").fetchone()[0] == 1
+    assert conn.execute("SELECT status FROM application_candidates").fetchone()[0] == "pending"
+
+
+def test_accept_candidate_is_a_noop_after_first_accept(conn):
+    jt.insert_application_candidate(
+        conn,
+        raw_input="Acme backend role",
+        company="Acme",
+        role="Backend Engineer",
+        lane="swe",
+        applied_on="2026-08-03",
+    )
+    parser = jt.build_parser()
+    args = parser.parse_args(["candidates", "accept", "1"])
+
+    jt.cmd_candidates(conn, args)
+    jt.cmd_candidates(conn, args)
+
+    assert conn.execute("SELECT COUNT(*) FROM applications").fetchone()[0] == 1
+    row = conn.execute("SELECT status, accepted_application_id FROM application_candidates").fetchone()
+    assert row["status"] == "accepted"
+    assert row["accepted_application_id"] == 1
+
+
+def test_reject_candidate_leaves_applications_and_events_untouched(conn):
+    jt.insert_application_candidate(conn, raw_input="not worth tracking")
+    parser = jt.build_parser()
+    args = parser.parse_args(["candidates", "reject", "1", "--note", "spam"])
+
+    jt.cmd_candidates(conn, args)
+
+    row = conn.execute("SELECT status, rejected_note FROM application_candidates").fetchone()
+    assert dict(row) == {"status": "rejected", "rejected_note": "spam"}
+    assert conn.execute("SELECT COUNT(*) FROM applications").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
+
+
+def test_candidate_count_appears_in_daily_banner(conn):
+    jt.insert_application_candidate(conn, raw_input="Acme backend role")
+
+    banner = jt.review_banner(conn)
+
+    assert "1 application candidate(s) awaiting decision" in banner
+    assert "jt candidates" in banner
+
+
+# --------------------------------------------------------------------------
 # derive()
 # --------------------------------------------------------------------------
 

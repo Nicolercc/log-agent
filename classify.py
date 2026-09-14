@@ -585,6 +585,35 @@ def write_review(conn, verdict: Verdict) -> None:
     )
 
 
+def _routes_to_application_candidate(verdict: Verdict) -> bool:
+    if verdict.proposal is None:
+        return False
+    return (
+        verdict.reason == "no applications exist to match against"
+        or verdict.reason.startswith("no application company match")
+    )
+
+
+def write_application_candidate(conn, verdict: Verdict) -> None:
+    assert verdict.proposal is not None
+    p = verdict.proposal
+    jt.insert_application_candidate(
+        conn,
+        raw_input=json.dumps(p, sort_keys=True),
+        source="classifier",
+        source_ref=f"gmail:{verdict.gmail_msg_id}",
+        company=p.get("company") if isinstance(p.get("company"), str) else None,
+        role=p.get("role_hint") if isinstance(p.get("role_hint"), str) else None,
+        applied_on=p.get("occurred_on") if isinstance(p.get("occurred_on"), str) else None,
+        notes=(
+            "classifier proposed "
+            f"{p.get('kind')!r}; routed to candidates because {verdict.reason}; "
+            f"evidence={p.get('evidence')!r}"
+        ),
+        commit=False,
+    )
+
+
 def commit_verdict(conn, verdict: Verdict) -> str:
     assert verdict.proposal is not None and verdict.application_id is not None
     p = verdict.proposal
@@ -615,7 +644,10 @@ def apply_verdicts(conn, verdicts: list[Verdict]) -> tuple[int, int]:
             else:
                 committed += 1
         else:
-            write_review(conn, verdict)
+            if _routes_to_application_candidate(verdict):
+                write_application_candidate(conn, verdict)
+            else:
+                write_review(conn, verdict)
             reviewed += 1
         conn.execute(
             "UPDATE raw_messages SET processed = 1 WHERE gmail_msg_id = ?",

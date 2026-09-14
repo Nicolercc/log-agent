@@ -49,6 +49,7 @@ Usage:
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 import sqlite3
@@ -58,7 +59,7 @@ from pathlib import Path
 
 from transitions import is_legal
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # --------------------------------------------------------------------------
 # Domain vocabulary. You own this. Changing it is a schema-level decision.
@@ -198,6 +199,33 @@ CREATE TABLE IF NOT EXISTS review_queue (
     resolved_at TEXT,
     created_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- Local intake for possible applications. Nothing here is authoritative:
+-- a human must explicitly accept a pending candidate before applications
+-- changes, and acceptance uses the same validated insert path as `jt add`.
+CREATE TABLE IF NOT EXISTS application_candidates (
+    id            INTEGER PRIMARY KEY,
+    raw_input     TEXT NOT NULL,
+    source        TEXT NOT NULL DEFAULT 'manual_capture',
+    source_ref    TEXT UNIQUE,
+    company       TEXT,
+    role          TEXT,
+    lane          TEXT CHECK (lane IS NULL OR lane IN ('swe','ops','comms')),
+    applied_on    DATE,
+    contact_email TEXT,
+    url           TEXT,
+    notes         TEXT,
+    status        TEXT NOT NULL DEFAULT 'pending'
+                  CHECK (status IN ('pending','accepted','rejected')),
+    accepted_application_id INTEGER REFERENCES applications(id) ON DELETE RESTRICT,
+    rejected_note TEXT,
+    decided_at    TEXT,
+    created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_application_candidates_url_unique
+ON application_candidates(url)
+WHERE url IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS sync_state (
     key   TEXT PRIMARY KEY,
@@ -462,6 +490,12 @@ def pending_reviews(conn) -> int:
         "SELECT COUNT(*) FROM review_queue WHERE resolved = 0").fetchone()[0]
 
 
+def pending_candidates(conn) -> int:
+    return conn.execute(
+        "SELECT COUNT(*) FROM application_candidates WHERE status = 'pending'"
+    ).fetchone()[0]
+
+
 def classify_log_path() -> Path:
     return Path(os.environ.get("JT_LOG_DIR", str(Path.home() / ".jobtrack" / "logs"))) / "jt-classify.jsonl"
 
@@ -588,35 +622,77 @@ def table(headers, rows) -> str:
 
 
 def review_banner(conn) -> str:
+    chunks = []
     n = pending_reviews(conn)
-    if not n:
-        return ""
-    return (f"\n  !! {n} classification(s) awaiting review. A growing queue means\n"
-            f"     the system is silently missing events. Run: jt review\n")
+    if n:
+        chunks.append(
+            f"  !! {n} classification(s) awaiting review. A growing queue means\n"
+            f"     the system is silently missing events. Run: jt review\n"
+        )
+    c = pending_candidates(conn)
+    if c:
+        chunks.append(
+            f"  !! {c} application candidate(s) awaiting decision. A growing queue means\n"
+            f"     capture is invisible after creation. Run: jt candidates\n"
+        )
+    return "\n" + "".join(chunks) if chunks else ""
 
 
 # --------------------------------------------------------------------------
 # Commands
 # --------------------------------------------------------------------------
 
-def cmd_add(conn, a):
-    day = parse_day(a.on)
+def _application_fields(a) -> tuple[str, str, str, str, str | None, str | None, str | None, str | None]:
+    day = parse_day(getattr(a, "on", None))
     company = a.company.strip()
     role = a.role.strip()
+    lane = a.lane
     if not company or not role:
         sys.exit("error: company and role must be non-empty")
+    if lane not in LANES:
+        sys.exit(f"error: lane must be one of: {', '.join(LANES)}")
+    return (
+        company,
+        role,
+        lane,
+        day,
+        getattr(a, "source", None),
+        getattr(a, "contact", None),
+        getattr(a, "url", None),
+        getattr(a, "notes", None),
+    )
+
+
+def _find_application_by_key(conn, company: str, role: str, applied_on: str):
+    return conn.execute(
+        """SELECT * FROM applications
+           WHERE company = ? AND role = ? AND applied_on = ?""",
+        (company, role, applied_on),
+    ).fetchone()
+
+
+def _insert_application(conn, a) -> tuple[int, tuple]:
+    fields = _application_fields(a)
+    cur = conn.execute(
+        """INSERT INTO applications
+           (company, role, lane, applied_on, source, contact_email, url, notes)
+           VALUES (?,?,?,?,?,?,?,?)""",
+        fields,
+    )
+    return cur.lastrowid, fields
+
+
+def cmd_add(conn, a):
     try:
-        cur = conn.execute(
-            """INSERT INTO applications
-               (company, role, lane, applied_on, source, contact_email, url, notes)
-               VALUES (?,?,?,?,?,?,?,?)""",
-            (company, role, a.lane, day,
-             a.source, a.contact, a.url, a.notes),
-        )
+        app_id, fields = _insert_application(conn, a)
         conn.commit()
-        print(f"#{cur.lastrowid}  {company} - {role}  [{a.lane}]  applied {day}")
+        company, role, lane, day = fields[:4]
+        print(f"#{app_id}  {company} - {role}  [{lane}]  applied {day}")
     except sqlite3.IntegrityError:
-        print(f"already logged: {company} - {role} on {day}")
+        company, role, _, day = _application_fields(a)[:4]
+        existing = _find_application_by_key(conn, company, role, day)
+        suffix = f" as #{existing['id']}" if existing else ""
+        print(f"already logged{suffix}: {company} - {role} on {day}")
 
 
 def cmd_bulk(conn, a):
@@ -643,10 +719,12 @@ def cmd_bulk(conn, a):
             skipped += 1
             continue
         try:
-            conn.execute(
-                "INSERT INTO applications (company, role, lane, applied_on, url) "
-                "VALUES (?,?,?,?,?)",
-                (company, role, lane, day, url),
+            _insert_application(
+                conn,
+                argparse.Namespace(
+                    company=company, role=role, lane=lane, on=day,
+                    source=None, contact=None, url=url, notes=None,
+                ),
             )
             added += 1
         except sqlite3.IntegrityError:
@@ -823,6 +901,211 @@ def cmd_backup(conn, a):
     print(f"backed up to {db_copy} and {csv_copy}")
 
 
+def _clean_optional(value: str | None) -> str | None:
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
+
+
+def _default_source_ref(source: str, raw_input: str, source_ref: str | None) -> str | None:
+    source_ref = _clean_optional(source_ref)
+    if source_ref:
+        return source_ref
+    if not raw_input:
+        return None
+    digest = hashlib.sha256(raw_input.encode("utf-8")).hexdigest()
+    return f"{source}:{digest}"
+
+
+def insert_application_candidate(
+    conn,
+    *,
+    raw_input: str,
+    source: str = "manual_capture",
+    source_ref: str | None = None,
+    company: str | None = None,
+    role: str | None = None,
+    lane: str | None = None,
+    applied_on: str | None = None,
+    contact_email: str | None = None,
+    url: str | None = None,
+    notes: str | None = None,
+    commit: bool = True,
+) -> tuple[int | None, bool]:
+    source = _clean_optional(source) or "manual_capture"
+    source_ref = _default_source_ref(source, raw_input, source_ref)
+    company = _clean_optional(company)
+    role = _clean_optional(role)
+    lane = _clean_optional(lane)
+    contact_email = _clean_optional(contact_email)
+    url = _clean_optional(url)
+    notes = _clean_optional(notes)
+    if applied_on:
+        applied_on = parse_day(applied_on)
+    if lane and lane not in LANES:
+        sys.exit(f"error: lane must be one of: {', '.join(LANES)}")
+
+    cur = conn.execute(
+        """INSERT OR IGNORE INTO application_candidates
+           (raw_input, source, source_ref, company, role, lane, applied_on,
+            contact_email, url, notes)
+           VALUES (?,?,?,?,?,?,?,?,?,?)""",
+        (raw_input, source, source_ref, company, role, lane, applied_on,
+        contact_email, url, notes),
+    )
+    if commit:
+        conn.commit()
+    if cur.rowcount:
+        return cur.lastrowid, True
+    existing = None
+    if source_ref:
+        existing = conn.execute(
+            "SELECT id FROM application_candidates WHERE source_ref = ?",
+            (source_ref,),
+        ).fetchone()
+    if existing is None and url:
+        existing = conn.execute(
+            "SELECT id FROM application_candidates WHERE url = ?",
+            (url,),
+        ).fetchone()
+    return (existing["id"] if existing else None), False
+
+
+def cmd_capture(conn, a):
+    raw_input = " ".join(a.text) if a.text else sys.stdin.read()
+    candidate_id, inserted = insert_application_candidate(
+        conn,
+        raw_input=raw_input,
+        source=a.source,
+        source_ref=a.source_ref,
+        company=a.company,
+        role=a.role,
+        lane=a.lane,
+        applied_on=a.on,
+        contact_email=a.contact,
+        url=a.url,
+        notes=a.notes,
+    )
+    if inserted:
+        print(f"captured candidate #{candidate_id}")
+    else:
+        print(f"already captured candidate #{candidate_id}; no-op")
+
+
+def _candidate_application_args(candidate, a):
+    return argparse.Namespace(
+        company=a.company if a.company is not None else (candidate["company"] or ""),
+        role=a.role if a.role is not None else (candidate["role"] or ""),
+        lane=a.lane if a.lane is not None else (candidate["lane"] or ""),
+        on=a.on if a.on is not None else candidate["applied_on"],
+        source=a.source if a.source is not None else candidate["source"],
+        contact=a.contact if a.contact is not None else candidate["contact_email"],
+        url=a.url if a.url is not None else candidate["url"],
+        notes=a.notes if a.notes is not None else candidate["notes"],
+    )
+
+
+def cmd_candidate_accept(conn, a):
+    candidate = conn.execute(
+        "SELECT * FROM application_candidates WHERE id = ?", (a.candidate_id,)
+    ).fetchone()
+    if not candidate:
+        sys.exit(f"error: no application candidate #{a.candidate_id}")
+    if candidate["status"] == "accepted":
+        print(
+            f"candidate #{a.candidate_id} already accepted"
+            + (f" as application #{candidate['accepted_application_id']}"
+               if candidate["accepted_application_id"] else "")
+        )
+        return
+    if candidate["status"] == "rejected":
+        print(f"candidate #{a.candidate_id} already rejected")
+        return
+
+    app_args = _candidate_application_args(candidate, a)
+    company, role, _, day = _application_fields(app_args)[:4]
+    existing = _find_application_by_key(conn, company, role, day)
+    if existing:
+        sys.exit(f"error: matching application already exists as #{existing['id']}")
+
+    conn.commit()
+    old_isolation = conn.isolation_level
+    conn.isolation_level = None
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        cur = conn.execute(
+            """UPDATE application_candidates
+               SET status = 'accepted', decided_at = datetime('now')
+               WHERE id = ? AND status = 'pending'""",
+            (a.candidate_id,),
+        )
+        if cur.rowcount == 0:
+            conn.execute("COMMIT")
+            print(f"candidate #{a.candidate_id} was already decided")
+            return
+        app_id, fields = _insert_application(conn, app_args)
+        conn.execute(
+            """UPDATE application_candidates
+               SET accepted_application_id = ?
+               WHERE id = ?""",
+            (app_id, a.candidate_id),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.isolation_level = old_isolation
+
+    company, role, lane, day = fields[:4]
+    print(f"accepted candidate #{a.candidate_id} as #{app_id}  {company} - {role}  [{lane}]  applied {day}")
+
+
+def cmd_candidate_reject(conn, a):
+    candidate = conn.execute(
+        "SELECT * FROM application_candidates WHERE id = ?", (a.candidate_id,)
+    ).fetchone()
+    if not candidate:
+        sys.exit(f"error: no application candidate #{a.candidate_id}")
+    cur = conn.execute(
+        """UPDATE application_candidates
+           SET status = 'rejected',
+               rejected_note = ?,
+               decided_at = datetime('now')
+           WHERE id = ? AND status = 'pending'""",
+        (a.note, a.candidate_id),
+    )
+    conn.commit()
+    if cur.rowcount == 0:
+        print(f"candidate #{a.candidate_id} was already decided")
+    else:
+        print(f"rejected candidate #{a.candidate_id}")
+
+
+def cmd_candidates(conn, a):
+    if getattr(a, "candidate_cmd", None) == "accept":
+        return cmd_candidate_accept(conn, a)
+    if getattr(a, "candidate_cmd", None) == "reject":
+        return cmd_candidate_reject(conn, a)
+    rows = conn.execute(
+        """SELECT * FROM application_candidates
+           WHERE status = 'pending'
+           ORDER BY id"""
+    ).fetchall()
+    out = []
+    for r in rows:
+        preview = (r["raw_input"] or "").replace("\n", " ")[:36]
+        out.append([
+            r["id"], r["created_at"][:10], r["source"],
+            (r["company"] or "-")[:24], (r["role"] or "-")[:28],
+            r["lane"] or "-", r["applied_on"] or "-", r["url"] or preview,
+        ])
+    print()
+    print(table(["#", "CREATED", "SOURCE", "COMPANY", "ROLE", "LANE", "APPLIED", "REF"], out))
+    print(f"\n  {len(rows)} pending candidate(s)\n")
+
+
 def cmd_review(conn, a):
     if getattr(a, "review_cmd", None) == "stale":
         return cmd_review_stale(conn, a)
@@ -947,6 +1230,40 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("backup", help="snapshot db + csv to a directory")
     s.add_argument("dir"); s.set_defaults(fn=cmd_backup)
+
+    s = sub.add_parser("capture", help="capture a possible application from stdin/text")
+    s.add_argument("text", nargs="*")
+    s.add_argument("--source", default="manual_capture")
+    s.add_argument("--source-ref")
+    s.add_argument("--company")
+    s.add_argument("--role")
+    s.add_argument("--lane", choices=LANES)
+    s.add_argument("--on")
+    s.add_argument("--contact")
+    s.add_argument("--url")
+    s.add_argument("--notes")
+    s.set_defaults(fn=cmd_capture)
+
+    s = sub.add_parser("candidates", help="pending captured application candidates")
+    cand = s.add_subparsers(dest="candidate_cmd")
+    s.set_defaults(fn=cmd_candidates)
+
+    c = cand.add_parser("accept", help="accept one candidate as an application")
+    c.add_argument("candidate_id", type=int)
+    c.add_argument("company", nargs="?")
+    c.add_argument("role", nargs="?")
+    c.add_argument("--lane", choices=LANES)
+    c.add_argument("--on")
+    c.add_argument("--source")
+    c.add_argument("--contact")
+    c.add_argument("--url")
+    c.add_argument("--notes")
+    c.set_defaults(fn=cmd_candidates)
+
+    c = cand.add_parser("reject", help="reject one candidate")
+    c.add_argument("candidate_id", type=int)
+    c.add_argument("--note")
+    c.set_defaults(fn=cmd_candidates)
 
     s = sub.add_parser("review", help="pending classifier proposals (Phase 3)")
     s.add_argument("review_cmd", nargs="?", choices=["stale"])

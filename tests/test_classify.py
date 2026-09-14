@@ -168,6 +168,38 @@ def test_hallucinated_evidence_goes_to_review(conn):
     assert "evidence is not" in conn.execute("SELECT reason FROM review_queue").fetchone()[0]
 
 
+def test_unmatched_classifier_proposal_creates_application_candidate(conn):
+    add_raw(conn)
+
+    seen, committed, reviewed = classify.process_batch(
+        conn, FakeClient(json.dumps([proposal()])))
+
+    assert (seen, committed, reviewed) == (1, 0, 1)
+    assert conn.execute("SELECT COUNT(*) FROM review_queue").fetchone()[0] == 0
+    row = conn.execute("SELECT * FROM application_candidates").fetchone()
+    assert row["source"] == "classifier"
+    assert row["source_ref"] == "gmail:m1"
+    assert row["company"] == "Company A"
+    assert row["role"] == "Backend Engineer"
+    assert row["applied_on"] == "2026-08-02"
+    assert row["status"] == "pending"
+    assert conn.execute("SELECT processed FROM raw_messages").fetchone()[0] == 1
+
+
+def test_repeated_unmatched_classifier_proposal_is_a_noop_candidate(conn):
+    add_raw(conn)
+    raw = json.dumps([proposal()])
+
+    classify.process_batch(conn, FakeClient(raw))
+    conn.execute("UPDATE raw_messages SET processed = 0 WHERE gmail_msg_id = 'm1'")
+    conn.commit()
+    classify.process_batch(conn, FakeClient(raw))
+
+    assert conn.execute("SELECT COUNT(*) FROM application_candidates").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM applications").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
+
+
 def test_same_company_two_roles_requires_role_hint(conn):
     add_app(conn, company="Company A", role="Backend Engineer")
     add_app(conn, company="Company A", role="Platform Engineer")
